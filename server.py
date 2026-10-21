@@ -1,13 +1,15 @@
-"""Servidor de salas online para Truco Cordobes (MVP de lobby).
+"""Servidor de salas y retransmisión de eventos para Truco Cordobés.
 Deploy gratuito en Render: Python + FastAPI + WebSockets.
-Esta primera entrega administra salas, invitaciones y matchmaking; no arbitra aun las bazas/apuestas.
 """
-import asyncio, json, secrets, string
+import asyncio
+import json
+import secrets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 app = FastAPI(title="Truco Cordobes Online")
-rooms = {}      # codigo -> {players:[{name,ws}], lock:asyncio.Lock}
-waiting = []    # sockets en busqueda rapida
+rooms = {}
+waiting = []
+rooms_lock = asyncio.Lock()
 
 
 def code_room():
@@ -17,6 +19,7 @@ def code_room():
         if code not in rooms:
             return code
 
+
 async def send(ws, payload):
     try:
         await ws.send_text(json.dumps(payload, ensure_ascii=False))
@@ -24,94 +27,114 @@ async def send(ws, payload):
     except Exception:
         return False
 
-async def broadcast(room, payload):
+
+async def broadcast(room, payload, exclude=None):
     dead = []
     for p in list(room["players"]):
+        if p["ws"] is exclude:
+            continue
         if not await send(p["ws"], payload):
             dead.append(p)
     for p in dead:
         if p in room["players"]:
             room["players"].remove(p)
 
+
 async def attach(room_code, name, ws):
     room = rooms.get(room_code)
-    if room is None:
-        return False
-    if len(room["players"]) >= 2:
-        return False
-    if any(p["ws"] is ws for p in room["players"]):
-        return True
-    room["players"].append({"name": name[:32] or "Jugador", "ws": ws})
-    await broadcast(room, {"type":"lobby", "room":room_code,
-                           "players":[p["name"] for p in room["players"]],
-                           "ready":len(room["players"]) == 2})
+    if room is None or len(room["players"]) >= 2:
+        return None
+    existing = next((p for p in room["players"] if p["ws"] is ws), None)
+    if existing:
+        return existing["slot"]
+    slot = len(room["players"])
+    room["players"].append({"name": name[:32] or "Jugador", "ws": ws, "slot": slot})
+    await broadcast(room, {
+        "type": "lobby", "room": room_code,
+        "players": [p["name"] for p in room["players"]],
+        "ready": len(room["players"]) == 2
+    })
     if len(room["players"]) == 2:
-        await broadcast(room, {"type":"match_found", "room":room_code,
-                               "players":[p["name"] for p in room["players"]],
-                               "message":"Rival conectado. La sala esta lista."})
-    return True
+        await broadcast(room, {
+            "type": "match_found", "room": room_code,
+            "players": [p["name"] for p in room["players"]],
+            "message": "Rival conectado. La sala esta lista."
+        })
+    return slot
+
 
 @app.get("/")
 def health():
-    return {"status":"ok", "service":"Truco Cordobes Online", "rooms":len(rooms)}
+    return {"status": "ok", "service": "Truco Cordobes Online", "rooms": len(rooms)}
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     room_code = None
     player_name = "Jugador"
+    slot = None
+    ticket = None
     try:
         raw = await ws.receive_text()
         try:
             req = json.loads(raw)
         except Exception:
-            await send(ws, {"type":"error", "message":"Formato de mensaje invalido."})
+            await send(ws, {"type": "error", "message": "Formato de mensaje invalido."})
             return
         action = req.get("action")
         player_name = str(req.get("name", "Jugador"))[:32].strip() or "Jugador"
 
         if action == "create":
             room_code = code_room()
-            rooms[room_code] = {"players":[], "lock":asyncio.Lock()}
-            await attach(room_code, player_name, ws)
-            await send(ws, {"type":"created", "room":room_code,
-                           "message":"Sala creada. Compartile el codigo a tu rival."})
+            rooms[room_code] = {"players": [], "lock": asyncio.Lock(), "seq": 0}
+            slot = await attach(room_code, player_name, ws)
+            await send(ws, {"type": "created", "room": room_code, "slot": slot,
+                            "message": "Sala creada. Compartile el codigo a tu rival."})
         elif action == "join":
             room_code = str(req.get("room", "")).strip().upper()
-            if not await attach(room_code, player_name, ws):
-                await send(ws, {"type":"error", "message":"Codigo inexistente o sala completa."})
+            slot = await attach(room_code, player_name, ws)
+            if slot is None:
+                await send(ws, {"type": "error", "message": "Codigo inexistente o sala completa."})
                 return
-            await send(ws, {"type":"joined", "room":room_code})
+            await send(ws, {"type": "joined", "room": room_code, "slot": slot})
         elif action == "search":
-            # Toma al primer rival conectado que siga esperando.
-            opponent = None
-            while waiting and opponent is None:
-                candidate = waiting.pop(0)
-                if candidate.get("ws") is not ws and not candidate.get("matched"):
-                    opponent = candidate
+            async with rooms_lock:
+                while waiting and waiting[0].get("ws") is ws:
+                    waiting.pop(0)
+                opponent = None
+                while waiting and opponent is None:
+                    candidate = waiting.pop(0)
+                    if candidate["ws"] is not ws and not candidate.get("matched"):
+                        opponent = candidate
+                if opponent:
+                    room_code = code_room()
+                    rooms[room_code] = {"players": [], "lock": asyncio.Lock(), "seq": 0}
+                    opponent["matched"] = True
+                    opponent["room"] = room_code
+                else:
+                    ticket = {"ws": ws, "name": player_name, "matched": False}
+                    waiting.append(ticket)
             if opponent:
-                room_code = code_room()
-                rooms[room_code] = {"players":[], "lock":asyncio.Lock()}
-                opponent["matched"] = True
-                opponent["room"] = room_code
+                room_code = opponent["room"]
+                # Primer jugador conserva slot 0; el buscador queda slot 1.
                 await attach(room_code, opponent["name"], opponent["ws"])
-                await attach(room_code, player_name, ws)
-                await send(ws, {"type":"match_found", "room":room_code,
-                               "players":[opponent["name"], player_name]})
-                await send(opponent["ws"], {"type":"match_found", "room":room_code,
-                                              "players":[opponent["name"], player_name]})
+                slot = await attach(room_code, player_name, ws)
+                await send(ws, {"type": "match_found", "room": room_code, "slot": slot,
+                                "players": [opponent["name"], player_name]})
+                await send(opponent["ws"], {"type": "match_found", "room": room_code, "slot": 0,
+                                            "players": [opponent["name"], player_name]})
             else:
-                ticket = {"ws":ws, "name":player_name, "matched":False}
-                waiting.append(ticket)
-                await send(ws, {"type":"searching", "message":"Buscando rival; deja la conexion abierta."})
-                # Espera a que el socket se cierre o se empareje.
+                await send(ws, {"type": "searching", "message": "Buscando rival; deja la conexion abierta."})
                 while not ticket["matched"]:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.25)
+                room_code = ticket["room"]
+                slot = 0
         else:
-            await send(ws, {"type":"error", "message":"Accion desconocida. Usa create, join o search."})
+            await send(ws, {"type": "error", "message": "Accion desconocida. Usa create, join o search."})
             return
 
-        # Mantener el canal abierto y retransmitir eventos de lobby.
+        # Persistent event relay. Include authoritative sender slot and sequence.
         while True:
             raw = await ws.receive_text()
             try:
@@ -120,25 +143,36 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
             if msg.get("action") == "leave":
                 break
-            if room_code and msg.get("action") == "ping":
-                await send(ws, {"type":"pong"})
-            # Canal de eventos listo para la siguiente etapa de juego sincronizado.
-            elif room_code and msg.get("action") == "game_event":
+            if msg.get("action") == "ping":
+                await send(ws, {"type": "pong"})
+                continue
+            if msg.get("action") == "game_event" and room_code:
                 room = rooms.get(room_code)
-                if room:
-                    await broadcast(room, {"type":"game_event", "from":player_name,
-                                           "payload":msg.get("payload", {})})
+                if room is None:
+                    continue
+                async with room["lock"]:
+                    room["seq"] += 1
+                    envelope = {
+                        "type": "game_event",
+                        "room": room_code,
+                        "from_slot": slot,
+                        "seq": room["seq"],
+                        "payload": msg.get("payload", {})
+                    }
+                    await broadcast(room, envelope, exclude=ws)
     except WebSocketDisconnect:
         pass
     except Exception as exc:
-        try: await send(ws, {"type":"error", "message":str(exc)[:160]})
-        except Exception: pass
+        try:
+            await send(ws, {"type": "error", "message": str(exc)[:160]})
+        except Exception:
+            pass
     finally:
         waiting[:] = [t for t in waiting if t.get("ws") is not ws]
         if room_code and room_code in rooms:
             room = rooms[room_code]
             room["players"][:] = [p for p in room["players"] if p["ws"] is not ws]
             if room["players"]:
-                await broadcast(room, {"type":"opponent_left", "message":"El rival se desconecto."})
+                await broadcast(room, {"type": "opponent_left", "message": "El rival se desconecto."})
             else:
                 rooms.pop(room_code, None)

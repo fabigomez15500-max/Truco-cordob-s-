@@ -253,7 +253,8 @@ async def cerrar_jugador(room_code, room, slot, ws):
 # ------------------------------------------------------------------- HTTP
 async def health(request):
     return JSONResponse({"status": "ok", "service": "Truco Cordobes Online", "rooms": len(rooms),
-                         "db": banco.tipo, "persistente": banco.pg})
+                         "db": banco.tipo, "persistente": banco.pg,
+                         "database_url_cargada": banco.url_cargada})
 
 
 async def leer_json(request):

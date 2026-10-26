@@ -28,7 +28,9 @@ PREMIOS_TORNEO = [("clasificar", 1), ("octavos", 1), ("cuartos", 2), ("semifinal
 
 class Banco:
     def __init__(self, url=None, ruta_sqlite="truco.db"):
-        self.url = url if url is not None else os.environ.get("DATABASE_URL", "")
+        crudo = url if url is not None else os.environ.get("DATABASE_URL", "")
+        self.url_cargada = bool(str(crudo).strip())
+        self.url = str(crudo).strip().strip("\"'").strip()  # tolera comillas/espacios al pegar
         self.pg = self.url.startswith(("postgres://", "postgresql://"))
         self.ruta_sqlite = ruta_sqlite
         self._mem = None

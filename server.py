@@ -252,7 +252,8 @@ async def cerrar_jugador(room_code, room, slot, ws):
 
 # ------------------------------------------------------------------- HTTP
 async def health(request):
-    return JSONResponse({"status": "ok", "service": "Truco Cordobes Online", "rooms": len(rooms)})
+    return JSONResponse({"status": "ok", "service": "Truco Cordobes Online", "rooms": len(rooms),
+                         "db": banco.tipo, "persistente": banco.pg})
 
 
 async def leer_json(request):
@@ -279,7 +280,7 @@ async def registrar(request):
     recientes.append(ahora)
     registros_por_ip[ip] = recientes
     datos = await leer_json(request)
-    cid, token = await db(banco.crear_cuenta, str(datos.get("name", "Jugador")))
+    cid, token = await db(banco.crear_cuenta, str(datos.get("name", "Jugador")), datos.get("token"))
     return JSONResponse({"id": cid, "token": token, "coins": 0})
 
 
@@ -572,6 +573,9 @@ async def websocket_endpoint(ws: WebSocket):
 
 @contextlib.asynccontextmanager
 async def lifespan(app):
+    if not banco.pg:
+        print("[truco] ATENCIÓN: sin DATABASE_URL se usa SQLite local: los saldos y cuentas "
+              "se pierden cuando Render reinicia o duerme el servicio.")
     devueltas = await db(banco.devolver_abiertas)
     if devueltas:
         print(f"[truco] Se devolvieron {devueltas} apuestas que habían quedado abiertas.")

@@ -83,23 +83,39 @@ class Banco:
             q(f"""CREATE TABLE IF NOT EXISTS retenciones (
                     id {serial}, sala TEXT NOT NULL, cuenta TEXT NOT NULL,
                     monto BIGINT NOT NULL, abierta INTEGER NOT NULL DEFAULT 1, fecha BIGINT NOT NULL)""")
+            q("CREATE UNIQUE INDEX IF NOT EXISTS ix_cuentas_token ON cuentas (token_hash)")
         self._transaccion(trabajo)
+
+    @property
+    def tipo(self):
+        return "postgres" if self.pg else "sqlite (se borra al reiniciar el servidor)"
 
     @staticmethod
     def _hash_token(token):
         return hashlib.sha256(token.encode()).hexdigest()
 
     # ---------- cuentas ----------
-    def crear_cuenta(self, nombre):
+    def crear_cuenta(self, nombre, token=None):
+        """Crea una cuenta. Si el celular manda su propio token y ya existe, devuelve esa misma
+        cuenta (así un reintento por mala conexión no crea una segunda cuenta)."""
         nombre = (nombre or "Jugador").strip()[:32] or "Jugador"
-        token = secrets.token_urlsafe(24)
+        token = str(token) if token is not None else None
+        if token is not None and not 20 <= len(token) <= 100:
+            token = None
+        propio = token is not None
+        token = token or secrets.token_urlsafe(24)
+        th = self._hash_token(token)
 
         def trabajo(q):
+            if propio:
+                fila = q("SELECT id FROM cuentas WHERE token_hash = ?", (th,)).fetchone()
+                if fila:
+                    return fila[0]
             for _ in range(20):
                 cid = secrets.token_hex(4).upper()
                 if q("SELECT 1 FROM cuentas WHERE id = ?", (cid,)).fetchone() is None:
                     q("INSERT INTO cuentas (id, token_hash, nombre, monedas, creada) VALUES (?, ?, ?, 0, ?)",
-                      (cid, self._hash_token(token), nombre, int(time.time())))
+                      (cid, th, nombre, int(time.time())))
                     return cid
             raise RuntimeError("no se pudo generar un ID")
         return self._transaccion(trabajo), token

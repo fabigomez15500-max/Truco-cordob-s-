@@ -25,6 +25,17 @@ import time
 PREMIO_IA = 2  # gana la partida: cobra el doble de lo apostado
 PREMIOS_TORNEO = [("clasificar", 1), ("octavos", 1), ("cuartos", 2), ("semifinal", 3), ("final", 5)]
 
+# Gira Nacional: puntos de cada región (espejo del cliente). Premio por victoria = pt // 2.
+GIRA_PT = {
+    "arg.buenos_aires": 400, "arg.patagonia": 600, "arg.cuyo": 800, "arg.mesopotamia": 1000,
+    "arg.norte": 1200, "arg.malvinas": 1600,
+    "chi.norte_grande": 1000, "chi.norte_chico": 1200, "chi.zona_central": 1400,
+    "chi.sur": 1600, "chi.austral": 2000,
+    "uru.norte": 1600, "uru.centro": 1800, "uru.costa": 2400,
+}
+GIRA_VICTORIAS_REGION = 2
+GIRA_ESPERA = 60  # segundos mínimos entre dos victorias informadas
+
 
 class Banco:
     def __init__(self, url=None, ruta_sqlite="truco.db"):
@@ -85,6 +96,13 @@ class Banco:
             q(f"""CREATE TABLE IF NOT EXISTS retenciones (
                     id {serial}, sala TEXT NOT NULL, cuenta TEXT NOT NULL,
                     monto BIGINT NOT NULL, abierta INTEGER NOT NULL DEFAULT 1, fecha BIGINT NOT NULL)""")
+            q("""CREATE TABLE IF NOT EXISTS gira (
+                    cuenta TEXT PRIMARY KEY, nombre TEXT NOT NULL, club TEXT NOT NULL DEFAULT '',
+                    puntos BIGINT NOT NULL DEFAULT 0, torneos INTEGER NOT NULL DEFAULT 0,
+                    regiones TEXT NOT NULL DEFAULT '', conquistadas INTEGER NOT NULL DEFAULT 0,
+                    ultimo BIGINT NOT NULL DEFAULT 0, desde BIGINT NOT NULL DEFAULT 0)""")
+            q("""CREATE TABLE IF NOT EXISTS gira_eventos (
+                    id TEXT PRIMARY KEY, cuenta TEXT NOT NULL, fecha BIGINT NOT NULL)""")
             q("CREATE UNIQUE INDEX IF NOT EXISTS ix_cuentas_token ON cuentas (token_hash)")
         self._transaccion(trabajo)
 
@@ -317,4 +335,105 @@ class Banco:
                 return {"error": "Evento inválido."}
             saldo = int(q("SELECT monedas FROM cuentas WHERE id = ?", (cuenta_id,)).fetchone()[0])
             return {"coins": saldo, "pago": pago, "cerrado": cerrado}
+        return self._transaccion(trabajo)
+
+
+    # ---------- Gira Nacional: ranking online ----------
+    @staticmethod
+    def _gira_leer(texto):
+        out = {}
+        for par in (texto or "").split(","):
+            if ":" in par:
+                clave, v = par.rsplit(":", 1)
+                try: out[clave] = int(v)
+                except ValueError: pass
+        return out
+
+    @staticmethod
+    def _gira_escribir(regiones):
+        return ",".join(f"{k}:{v}" for k, v in sorted(regiones.items()))
+
+    def _gira_guardar(self, q, cuenta, nombre, club, puntos, torneos, regiones, ultimo):
+        conq = sum(1 for v in regiones.values() if v >= GIRA_VICTORIAS_REGION)
+        existe = q("SELECT 1 FROM gira WHERE cuenta = ?", (cuenta,)).fetchone()
+        datos = (nombre[:24], club[:40], puntos, torneos, self._gira_escribir(regiones), conq, ultimo)
+        if existe:
+            q("UPDATE gira SET nombre=?, club=?, puntos=?, torneos=?, regiones=?, conquistadas=?, ultimo=? "
+              "WHERE cuenta=?", datos + (cuenta,))
+        else:
+            q("INSERT INTO gira (nombre, club, puntos, torneos, regiones, conquistadas, ultimo, cuenta, desde) "
+              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", datos + (cuenta, int(time.time())))
+
+    def gira_victoria(self, cuenta_id, evento_id, region_clave, nombre="", club=""):
+        """Suma una victoria de mini campeonato. El premio lo fija el servidor."""
+        cuenta_id = str(cuenta_id).upper()
+        evento_id = str(evento_id)[:64]
+        if region_clave not in GIRA_PT or not evento_id:
+            return {"error": "Región inválida."}
+
+        def trabajo(q):
+            if q("SELECT 1 FROM gira_eventos WHERE id = ?", (evento_id,)).fetchone():
+                return {"repetido": True}
+            now = int(time.time())
+            fila = q("SELECT nombre, club, puntos, torneos, regiones, ultimo FROM gira WHERE cuenta = ?",
+                     (cuenta_id,)).fetchone()
+            nom, clb, puntos, torneos, regs, ultimo = (fila if fila else ("", "", 0, 0, "", 0))
+            if now - int(ultimo) < GIRA_ESPERA:
+                return {"error": "Victoria demasiado rápida; se reintentará."}
+            regiones = self._gira_leer(regs)
+            regiones[region_clave] = min(GIRA_VICTORIAS_REGION, regiones.get(region_clave, 0) + 1)
+            premio = GIRA_PT[region_clave] // 2
+            self._gira_guardar(q, cuenta_id, nombre or nom or "Jugador", club or clb, int(puntos) + premio,
+                               int(torneos) + 1, regiones, now)
+            q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (evento_id, cuenta_id, now))
+            return {"ok": True, "premio": premio}
+        return self._transaccion(trabajo)
+
+    def gira_sincronizar(self, cuenta_id, regiones, nombre="", club=""):
+        """Alta única de quien ya venía jugando: reconstruye un mínimo de puntos desde sus regiones."""
+        cuenta_id = str(cuenta_id).upper()
+
+        def trabajo(q):
+            if q("SELECT 1 FROM gira WHERE cuenta = ?", (cuenta_id,)).fetchone():
+                return {"ok": True, "ya": True}
+            limpio, puntos, torneos = {}, 0, 0
+            for clave, v in (regiones or {}).items():
+                try: v = max(0, min(GIRA_VICTORIAS_REGION, int(v)))
+                except (TypeError, ValueError): continue
+                if clave in GIRA_PT and v:
+                    limpio[clave] = v
+                    puntos += v * (GIRA_PT[clave] // 2)
+                    torneos += v
+            if not limpio:
+                return {"ok": True, "vacio": True}
+            self._gira_guardar(q, cuenta_id, nombre or "Jugador", club or "", puntos, torneos, limpio, 0)
+            return {"ok": True}
+        return self._transaccion(trabajo)
+
+    def gira_podio(self, limite=3):
+        """Los mejores por puntos entre quienes conquistaron al menos 1 región."""
+        def trabajo(q):
+            filas = q("SELECT nombre, club, puntos, conquistadas FROM gira WHERE conquistadas >= 1 "
+                      "ORDER BY puntos DESC, desde ASC LIMIT ?", (int(limite),)).fetchall()
+            total = q("SELECT COUNT(*) FROM gira WHERE conquistadas >= 1").fetchone()[0]
+            return {"podio": [{"puesto": i + 1, "nombre": f[0], "club": f[1], "puntos": int(f[2]),
+                               "regiones": int(f[3])} for i, f in enumerate(filas)],
+                    "total": int(total)}
+        return self._transaccion(trabajo)
+
+    def gira_estado(self, cuenta_id):
+        cuenta_id = str(cuenta_id).upper()
+
+        def trabajo(q):
+            fila = q("SELECT puntos, conquistadas, torneos, desde FROM gira WHERE cuenta = ?", (cuenta_id,)).fetchone()
+            total = int(q("SELECT COUNT(*) FROM gira WHERE conquistadas >= 1").fetchone()[0])
+            if not fila:
+                return {"registrado": False, "clasificado": False, "puesto": None, "total": total, "puntos": 0, "regiones": 0}
+            puntos, conq, torneos, desde = int(fila[0]), int(fila[1]), int(fila[2]), int(fila[3])
+            puesto = None
+            if conq >= 1:
+                puesto = 1 + int(q("SELECT COUNT(*) FROM gira WHERE conquistadas >= 1 AND "
+                                   "(puntos > ? OR (puntos = ? AND desde < ?))", (puntos, puntos, desde)).fetchone()[0])
+            return {"registrado": True, "clasificado": conq >= 1, "puesto": puesto, "total": total,
+                    "puntos": puntos, "regiones": conq, "torneos": torneos}
         return self._transaccion(trabajo)

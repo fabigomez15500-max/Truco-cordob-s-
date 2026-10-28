@@ -573,6 +573,43 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 @contextlib.asynccontextmanager
+async def gira_auth(request):
+    datos = await leer_json(request)
+    cid = str(datos.get("id", "")).strip().upper()
+    if not await db(banco.autenticar, cid, str(datos.get("token", ""))):
+        return None, datos, JSONResponse({"error": "Cuenta inválida."}, status_code=401)
+    return cid, datos, None
+
+
+async def gira_victoria(request):
+    cid, datos, error = await gira_auth(request)
+    if error:
+        return error
+    r = await db(banco.gira_victoria, cid, str(datos.get("evento", "")), str(datos.get("region", "")),
+                 str(datos.get("nombre", "")), str(datos.get("club", "")))
+    return JSONResponse(r, status_code=400 if "error" in r else 200)
+
+
+async def gira_sincronizar(request):
+    cid, datos, error = await gira_auth(request)
+    if error:
+        return error
+    regiones = datos.get("regiones") if isinstance(datos.get("regiones"), dict) else {}
+    return JSONResponse(await db(banco.gira_sincronizar, cid, regiones,
+                                 str(datos.get("nombre", "")), str(datos.get("club", ""))))
+
+
+async def gira_mi_estado(request):
+    cid, datos, error = await gira_auth(request)
+    if error:
+        return error
+    return JSONResponse(await db(banco.gira_estado, cid))
+
+
+async def gira_podio(request):
+    return JSONResponse(await db(banco.gira_podio, 3))
+
+
 async def lifespan(app):
     if not banco.pg:
         print("[truco] ATENCIÓN: sin DATABASE_URL se usa SQLite local: los saldos y cuentas "
@@ -591,6 +628,10 @@ app = Starlette(
         Route("/room/{code}", info_sala),
         Route("/apuesta/abrir", apuesta_abrir, methods=["POST"]),
         Route("/apuesta/reclamar", apuesta_reclamar, methods=["POST"]),
+        Route("/gira/victoria", gira_victoria, methods=["POST"]),
+        Route("/gira/sincronizar", gira_sincronizar, methods=["POST"]),
+        Route("/gira/mi_estado", gira_mi_estado, methods=["POST"]),
+        Route("/gira/podio", gira_podio),
         Route("/admin/credit", admin_recargar, methods=["POST"]),
         Route("/admin/account/{cid}", admin_cuenta),
         WebSocketRoute("/ws", websocket_endpoint),

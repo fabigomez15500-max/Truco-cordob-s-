@@ -238,12 +238,11 @@ class Banco:
         """Al arrancar: devuelve toda apuesta que quedó abierta por un reinicio."""
         def trabajo(q):
             return [f[0] for f in q("SELECT DISTINCT sala FROM retenciones WHERE abierta = 1").fetchall()]
-        salas = self._transaccion(trabajo)
+        salas = [x for x in self._transaccion(trabajo) if not x.startswith("T-")]
+        # Los tickets (IA / copa) NO se tocan: viven en la base de datos y el reinicio del servidor
+        # (Render gratis se duerme a los 15 min) no debe cerrarle la apuesta a quien está jugando.
         for sala in salas:
-            if sala.startswith("T-"):
-                self._devolver_ticket(sala[2:])
-            else:
-                self.liquidar(sala, None)
+            self.liquidar(sala, None)
         return len(salas)
 
     # ---------- apuestas contra la IA y campeonato (tickets) ----------

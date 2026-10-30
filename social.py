@@ -1,4 +1,4 @@
-"""Amigos de Truco Cordobés (Etapa 1: lista de amigos y estado en línea).
+"""Amigos de Truco Cordobés (Etapa 1: amigos y estado en línea. Etapa 2: chats directos).
 
 Usa la misma base que `economia.py` (Postgres o SQLite) a través de `banco._transaccion`.
 Las amistades se guardan una sola vez por pareja, con los IDs ordenados (a < b).
@@ -9,12 +9,17 @@ import time
 MAX_RELACIONES = 200      # amigos + solicitudes por cuenta
 MAX_ENVIADAS = 30         # solicitudes pendientes enviadas a la vez
 EN_LINEA_SEG = 45         # sin señal de vida en 45 s = desconectado
+MAX_TEXTO = 500           # largo máximo de un mensaje
+GUARDAR_MENSAJES = 200    # mensajes que se conservan por conversación
+RAFAGA_MAX = 8            # mensajes permitidos...
+RAFAGA_SEG = 10           # ...cada 10 segundos por cuenta
 
 
 class Social:
     def __init__(self, banco):
         self.b = banco
         self.visto = {}   # cuenta -> última señal de vida (time.time())
+        self.envios = {}  # cuenta -> horas de sus últimos mensajes (límite de ráfaga)
         self._crear_tablas()
 
     def _crear_tablas(self):
@@ -24,6 +29,11 @@ class Social:
                     aceptada INTEGER NOT NULL DEFAULT 0, fecha BIGINT NOT NULL,
                     PRIMARY KEY (a, b))""")
             q("CREATE INDEX IF NOT EXISTS ix_amistades_b ON amistades (b)")
+            serial = "BIGSERIAL PRIMARY KEY" if self.b.pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+            q(f"""CREATE TABLE IF NOT EXISTS mensajes (
+                    id {serial}, de TEXT NOT NULL, para TEXT NOT NULL, texto TEXT NOT NULL,
+                    fecha BIGINT NOT NULL, leido INTEGER NOT NULL DEFAULT 0)""")
+            q("CREATE INDEX IF NOT EXISTS ix_mensajes_par ON mensajes (para, de, leido)")
         self.b._transaccion(trabajo)
 
     # ---------- presencia ----------
@@ -101,6 +111,7 @@ class Social:
 
         def trabajo(q):
             q("DELETE FROM amistades WHERE a = ? AND b = ?", (a, b))
+            q("DELETE FROM mensajes WHERE (de = ? AND para = ?) OR (de = ? AND para = ?)", (cid, otro, otro, cid))
             return {"ok": True}
         return self.b._transaccion(trabajo)
 
@@ -116,19 +127,22 @@ class Social:
         def trabajo(q):
             filas = q("SELECT a, b, pidio, aceptada FROM amistades WHERE a = ? OR b = ? ORDER BY fecha DESC",
                       (cid, cid)).fetchall()
+            sin_leer = {de: int(n) for de, n in q(
+                "SELECT de, COUNT(*) FROM mensajes WHERE para = ? AND leido = 0 GROUP BY de", (cid,)).fetchall()}
             nombres = {}
             for a, b, _p, _ac in filas:
                 otro = b if a == cid else a
                 fila = q("SELECT nombre FROM cuentas WHERE id = ?", (otro,)).fetchone()
                 nombres[otro] = fila[0] if fila else "Jugador"
-            return filas, nombres
-        filas, nombres = self.b._transaccion(trabajo)
+            return filas, nombres, sin_leer
+        filas, nombres, sin_leer = self.b._transaccion(trabajo)
         amigos, recibidas, enviadas = [], [], []
         for a, b, pidio, aceptada in filas:
             otro = b if a == cid else a
             item = {"id": otro, "nombre": nombres.get(otro, "Jugador")}
             if int(aceptada):
                 item["en_linea"] = self.en_linea(otro)
+                item["sin_leer"] = sin_leer.get(otro, 0)
                 amigos.append(item)
             elif pidio == cid:
                 enviadas.append(item)
@@ -137,3 +151,66 @@ class Social:
         # En línea primero, después por nombre.
         amigos.sort(key=lambda x: (not x["en_linea"], x["nombre"].lower()))
         return {"amigos": amigos, "recibidas": recibidas, "enviadas": enviadas}
+
+    # ---------- chats directos ----------
+    def total_sin_leer(self, cid):
+        def trabajo(q):
+            return int(q("SELECT COUNT(*) FROM mensajes WHERE para = ? AND leido = 0", (cid,)).fetchone()[0])
+        return self.b._transaccion(trabajo)
+
+    def enviar(self, cid, otro, texto):
+        otro = self._id(otro)
+        texto = " ".join(str(texto or "").split())[:MAX_TEXTO]   # sin saltos ni espacios de más
+        if not texto:
+            return {"error": "Escribí un mensaje."}
+        ahora = time.time()
+        recientes = [t for t in self.envios.get(cid, []) if ahora - t < RAFAGA_SEG]
+        if len(recientes) >= RAFAGA_MAX:
+            self.envios[cid] = recientes
+            return {"error": "Estás mandando mensajes muy rápido."}
+        a, b = self._par(cid, otro)
+
+        def trabajo(q):
+            fila = q("SELECT aceptada FROM amistades WHERE a = ? AND b = ?", (a, b)).fetchone()
+            if not fila or not int(fila[0]):
+                return {"error": "Solo podés chatear con tus amigos."}
+            q("INSERT INTO mensajes (de, para, texto, fecha, leido) VALUES (?, ?, ?, ?, 0)",
+              (cid, otro, texto, int(ahora)))
+            nuevo = q("SELECT id FROM mensajes WHERE de = ? AND para = ? ORDER BY id DESC LIMIT 1",
+                      (cid, otro)).fetchone()[0]
+            # Conserva solo los últimos GUARDAR_MENSAJES de la conversación.
+            corte = q("SELECT id FROM mensajes WHERE (de = ? AND para = ?) OR (de = ? AND para = ?) "
+                      "ORDER BY id DESC LIMIT 1 OFFSET ?", (cid, otro, otro, cid, GUARDAR_MENSAJES)).fetchone()
+            if corte:
+                q("DELETE FROM mensajes WHERE ((de = ? AND para = ?) OR (de = ? AND para = ?)) AND id <= ?",
+                  (cid, otro, otro, cid, int(corte[0])))
+            return {"ok": True, "id": int(nuevo)}
+        r = self.b._transaccion(trabajo)
+        if r.get("ok"):
+            recientes.append(ahora)
+            self.envios[cid] = recientes
+        return r
+
+    def leer(self, cid, otro, desde=0, limite=60):
+        """Mensajes de la conversación con id > desde (los últimos `limite` si desde = 0).
+        Los que te mandó el otro quedan marcados como leídos."""
+        otro = self._id(otro)
+        try:
+            desde = max(0, int(desde))
+        except (TypeError, ValueError):
+            desde = 0
+        a, b = self._par(cid, otro)
+
+        def trabajo(q):
+            fila = q("SELECT aceptada FROM amistades WHERE a = ? AND b = ?", (a, b)).fetchone()
+            if not fila or not int(fila[0]):
+                return {"error": "Solo podés chatear con tus amigos."}
+            filas = q("SELECT id, de, texto, fecha FROM mensajes WHERE id > ? AND "
+                      "((de = ? AND para = ?) OR (de = ? AND para = ?)) ORDER BY id DESC LIMIT ?",
+                      (desde, cid, otro, otro, cid, int(limite))).fetchall()
+            filas.reverse()
+            if filas:
+                q("UPDATE mensajes SET leido = 1 WHERE para = ? AND de = ? AND leido = 0", (cid, otro))
+            return {"mensajes": [{"id": int(i), "mio": de == cid, "texto": t, "fecha": int(f)}
+                                 for i, de, t, f in filas]}
+        return self.b._transaccion(trabajo)

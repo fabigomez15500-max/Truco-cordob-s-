@@ -314,7 +314,7 @@ async def amigos_latido(request):
     cid, datos, error = await amigos_auth(request)
     if error:
         return error
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True, "sin_leer": await db(social.total_sin_leer, cid)})
 
 
 async def amigos_listar(request):
@@ -343,6 +343,20 @@ async def amigos_eliminar(request):
     if error:
         return error
     return _respuesta_social(await db(social.eliminar, cid, datos.get("otro")))
+
+
+async def chat_enviar(request):
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    return _respuesta_social(await db(social.enviar, cid, datos.get("otro"), datos.get("texto")))
+
+
+async def chat_leer(request):
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    return _respuesta_social(await db(social.leer, cid, datos.get("otro"), datos.get("desde", 0)))
 
 
 async def info_sala(request):
@@ -683,6 +697,8 @@ app = Starlette(
         Route("/amigos/pedir", amigos_pedir, methods=["POST"]),
         Route("/amigos/responder", amigos_responder, methods=["POST"]),
         Route("/amigos/eliminar", amigos_eliminar, methods=["POST"]),
+        Route("/chat/enviar", chat_enviar, methods=["POST"]),
+        Route("/chat/leer", chat_leer, methods=["POST"]),
         Route("/apuesta/abrir", apuesta_abrir, methods=["POST"]),
         Route("/apuesta/reclamar", apuesta_reclamar, methods=["POST"]),
         Route("/gira/victoria", gira_victoria, methods=["POST"]),

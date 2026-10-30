@@ -1,9 +1,11 @@
-"""Amigos de Truco Cordobés (Etapa 1: amigos y estado en línea. Etapa 2: chats directos).
+"""Amigos de Truco Cordobés (Etapa 1: amigos y estado en línea. Etapa 2: chats directos.
+Etapa 3: invitaciones a jugar, que aparecen en el chat como una tarjeta con su estado).
 
 Usa la misma base que `economia.py` (Postgres o SQLite) a través de `banco._transaccion`.
 Las amistades se guardan una sola vez por pareja, con los IDs ordenados (a < b).
 El estado "en línea" no se guarda: se deduce de la última señal de vida (`latido`) del celular.
 """
+import secrets
 import time
 
 MAX_RELACIONES = 200      # amigos + solicitudes por cuenta
@@ -13,11 +15,15 @@ MAX_TEXTO = 500           # largo máximo de un mensaje
 GUARDAR_MENSAJES = 200    # mensajes que se conservan por conversación
 RAFAGA_MAX = 8            # mensajes permitidos...
 RAFAGA_SEG = 10           # ...cada 10 segundos por cuenta
+INVITACION_SEG = 90       # una invitación sin respuesta vence a los 90 s
+MARCA_INVITACION = "@@INV:"   # un mensaje que empieza así es una tarjeta de invitación
 
 
 class Social:
-    def __init__(self, banco):
+    def __init__(self, banco, sala_viva=None):
         self.b = banco
+        self.sala_viva = sala_viva or (lambda codigo: True)   # ¿la sala sigue esperando al invitado?
+        self.invitaciones = {}   # id -> {de, para, sala, apuesta, estado, creada} (viven poco: en memoria)
         self.visto = {}   # cuenta -> última señal de vida (time.time())
         self.envios = {}  # cuenta -> horas de sus últimos mensajes (límite de ráfaga)
         self._crear_tablas()
@@ -158,11 +164,13 @@ class Social:
             return int(q("SELECT COUNT(*) FROM mensajes WHERE para = ? AND leido = 0", (cid,)).fetchone()[0])
         return self.b._transaccion(trabajo)
 
-    def enviar(self, cid, otro, texto):
+    def enviar(self, cid, otro, texto, _interno=False):
         otro = self._id(otro)
         texto = " ".join(str(texto or "").split())[:MAX_TEXTO]   # sin saltos ni espacios de más
         if not texto:
             return {"error": "Escribí un mensaje."}
+        if texto.startswith(MARCA_INVITACION) and not _interno:
+            return {"error": "Mensaje inválido."}
         ahora = time.time()
         recientes = [t for t in self.envios.get(cid, []) if ahora - t < RAFAGA_SEG]
         if len(recientes) >= RAFAGA_MAX:
@@ -213,4 +221,75 @@ class Social:
                 q("UPDATE mensajes SET leido = 1 WHERE para = ? AND de = ? AND leido = 0", (cid, otro))
             return {"mensajes": [{"id": int(i), "mio": de == cid, "texto": t, "fecha": int(f)}
                                  for i, de, t, f in filas]}
-        return self.b._transaccion(trabajo)
+        r = self.b._transaccion(trabajo)
+        if "mensajes" in r:
+            r["invitaciones"] = self.estados(cid, otro)
+        return r
+
+    # ---------- invitaciones a jugar ----------
+    def _estado_inv(self, inv):
+        """Estado actual; una invitación pendiente vence por tiempo o si la sala ya no espera."""
+        if inv["estado"] == "pendiente" and (time.time() - inv["creada"] > INVITACION_SEG
+                                             or not self.sala_viva(inv["sala"])):
+            inv["estado"] = "expirada"
+        return inv["estado"]
+
+    def invitar(self, cid, otro, sala, apuesta):
+        otro = self._id(otro)
+        if not self.son_amigos(cid, otro):
+            return {"error": "Solo podés invitar a tus amigos."}
+        ahora = time.time()
+        for k, inv in list(self.invitaciones.items()):
+            if ahora - inv["creada"] > 3600:
+                self.invitaciones.pop(k, None)
+            elif inv["de"] == cid and self._estado_inv(inv) == "pendiente":
+                inv["estado"] = "cancelada"          # una sola invitación abierta por jugador
+        inv_id = secrets.token_hex(4)
+        self.invitaciones[inv_id] = {"de": cid, "para": otro, "sala": sala, "apuesta": int(apuesta),
+                                     "estado": "pendiente", "creada": ahora}
+        r = self.enviar(cid, otro, MARCA_INVITACION + inv_id, _interno=True)
+        if "error" in r:
+            self.invitaciones.pop(inv_id, None)
+            return r
+        return {"ok": True, "id": inv_id}
+
+    def responder_invitacion(self, cid, inv_id, aceptar):
+        inv = self.invitaciones.get(str(inv_id or ""))
+        if inv is None or inv["para"] != cid:
+            return {"error": "La invitación ya no está disponible."}
+        estado = self._estado_inv(inv)
+        if estado != "pendiente":
+            return {"error": "La invitación ya venció." if estado in ("expirada", "cancelada")
+                    else "Esa invitación ya fue respondida."}
+        inv["estado"] = "aceptada" if aceptar else "rechazada"
+        r = {"ok": True, "estado": inv["estado"], "apuesta": inv["apuesta"]}
+        if aceptar:
+            r["sala"] = inv["sala"]
+        return r
+
+    def estados(self, cid, otro):
+        """Estado de las invitaciones recientes entre estas dos cuentas, por id."""
+        otro = self._id(otro)
+        ahora = time.time()
+        res = {}
+        for k, inv in list(self.invitaciones.items()):
+            if {inv["de"], inv["para"]} == {cid, otro} and ahora - inv["creada"] < 1800:
+                res[k] = {"mio": inv["de"] == cid, "estado": self._estado_inv(inv), "apuesta": inv["apuesta"]}
+        return res
+
+    def pendientes(self, cid):
+        """Invitaciones que esperan tu respuesta (para avisarte aunque no tengas el chat abierto)."""
+        lista = [(k, inv) for k, inv in list(self.invitaciones.items())
+                 if inv["para"] == cid and self._estado_inv(inv) == "pendiente"]
+        if not lista:
+            return []
+
+        def trabajo(q):
+            nombres = {}
+            for _k, inv in lista:
+                f = q("SELECT nombre FROM cuentas WHERE id = ?", (inv["de"],)).fetchone()
+                nombres[inv["de"]] = f[0] if f else "Jugador"
+            return nombres
+        nombres = self.b._transaccion(trabajo)
+        return [{"id": k, "de": inv["de"], "nombre": nombres.get(inv["de"], "Jugador"), "apuesta": inv["apuesta"]}
+                for k, inv in lista]

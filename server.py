@@ -27,7 +27,15 @@ from economia import Banco
 from social import Social
 
 banco = Banco()
-social = Social(banco)
+
+
+def _sala_espera(codigo):
+    """True mientras la sala existe, no empezó y espera a un segundo jugador."""
+    room = rooms.get(codigo)
+    return room is not None and not room["started"] and len(room["players"]) == 1
+
+
+social = Social(banco, sala_viva=_sala_espera)
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 APUESTA_MIN = int(os.environ.get("APUESTA_MIN", "10"))
 APUESTA_MAX = int(os.environ.get("APUESTA_MAX", "100000"))
@@ -314,7 +322,8 @@ async def amigos_latido(request):
     cid, datos, error = await amigos_auth(request)
     if error:
         return error
-    return JSONResponse({"ok": True, "sin_leer": await db(social.total_sin_leer, cid)})
+    return JSONResponse({"ok": True, "sin_leer": await db(social.total_sin_leer, cid),
+                         "invitaciones": await db(social.pendientes, cid)})
 
 
 async def amigos_listar(request):
@@ -350,6 +359,25 @@ async def chat_enviar(request):
     if error:
         return error
     return _respuesta_social(await db(social.enviar, cid, datos.get("otro"), datos.get("texto")))
+
+
+async def chat_invitar(request):
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    sala = str(datos.get("sala", "")).strip().upper()
+    room = rooms.get(sala)
+    # La sala tiene que ser tuya (la creaste vos), seguir esperando y no estar llena.
+    if room is None or room.get("duenio") != cid or not _sala_espera(sala):
+        return JSONResponse({"error": "Esa sala ya no está disponible."}, status_code=400)
+    return _respuesta_social(await db(social.invitar, cid, datos.get("otro"), sala, room["bet"]))
+
+
+async def chat_invitacion(request):
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    return _respuesta_social(await db(social.responder_invitacion, cid, datos.get("invitacion"), bool(datos.get("aceptar"))))
 
 
 async def chat_leer(request):
@@ -460,6 +488,7 @@ async def websocket_endpoint(ws: WebSocket):
             bet, cuenta = validada
             room_code = code_room()
             rooms[room_code] = nueva_sala(bet)
+            rooms[room_code]["duenio"] = cuenta or await autenticar(req)   # dueño de la sala (solo para invitaciones)
             if bet > 0 and not await db(banco.retener, cuenta, room_code, bet):
                 rooms.pop(room_code, None)
                 room_code = None
@@ -699,6 +728,8 @@ app = Starlette(
         Route("/amigos/eliminar", amigos_eliminar, methods=["POST"]),
         Route("/chat/enviar", chat_enviar, methods=["POST"]),
         Route("/chat/leer", chat_leer, methods=["POST"]),
+        Route("/chat/invitar", chat_invitar, methods=["POST"]),
+        Route("/chat/invitacion", chat_invitacion, methods=["POST"]),
         Route("/apuesta/abrir", apuesta_abrir, methods=["POST"]),
         Route("/apuesta/reclamar", apuesta_reclamar, methods=["POST"]),
         Route("/gira/victoria", gira_victoria, methods=["POST"]),

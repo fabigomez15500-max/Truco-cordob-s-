@@ -24,8 +24,10 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from economia import Banco
+from social import Social
 
 banco = Banco()
+social = Social(banco)
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 APUESTA_MIN = int(os.environ.get("APUESTA_MIN", "10"))
 APUESTA_MAX = int(os.environ.get("APUESTA_MAX", "100000"))
@@ -291,6 +293,56 @@ async def billetera(request):
     if not await db(banco.autenticar, cid, str(datos.get("token", ""))):
         return JSONResponse({"error": "Cuenta inválida."}, status_code=401)
     return JSONResponse({"id": cid, "coins": await db(banco.saldo, cid)})
+
+
+# ---------------------------------------------------------------- amigos
+async def amigos_auth(request):
+    """Autentica la cuenta y, de paso, la marca como en línea (señal de vida)."""
+    datos = await leer_json(request)
+    cid = str(datos.get("id", "")).strip().upper()
+    if not await db(banco.autenticar, cid, str(datos.get("token", ""))):
+        return None, datos, JSONResponse({"error": "Cuenta inválida."}, status_code=401)
+    social.latido(cid)
+    return cid, datos, None
+
+
+def _respuesta_social(r):
+    return JSONResponse(r, status_code=400 if "error" in r else 200)
+
+
+async def amigos_latido(request):
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    return JSONResponse({"ok": True})
+
+
+async def amigos_listar(request):
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    return JSONResponse(await db(social.listar, cid))
+
+
+async def amigos_pedir(request):
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    return _respuesta_social(await db(social.pedir, cid, datos.get("otro")))
+
+
+async def amigos_responder(request):
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    return _respuesta_social(await db(social.responder, cid, datos.get("otro"), bool(datos.get("aceptar"))))
+
+
+async def amigos_eliminar(request):
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    return _respuesta_social(await db(social.eliminar, cid, datos.get("otro")))
 
 
 async def info_sala(request):
@@ -626,6 +678,11 @@ app = Starlette(
         Route("/register", registrar, methods=["POST"]),
         Route("/wallet", billetera, methods=["POST"]),
         Route("/room/{code}", info_sala),
+        Route("/amigos/latido", amigos_latido, methods=["POST"]),
+        Route("/amigos/listar", amigos_listar, methods=["POST"]),
+        Route("/amigos/pedir", amigos_pedir, methods=["POST"]),
+        Route("/amigos/responder", amigos_responder, methods=["POST"]),
+        Route("/amigos/eliminar", amigos_eliminar, methods=["POST"]),
         Route("/apuesta/abrir", apuesta_abrir, methods=["POST"]),
         Route("/apuesta/reclamar", apuesta_reclamar, methods=["POST"]),
         Route("/gira/victoria", gira_victoria, methods=["POST"]),

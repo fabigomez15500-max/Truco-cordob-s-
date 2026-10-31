@@ -78,6 +78,7 @@ class Banco:
             self.gira_sembrar_bots()
         else:
             self.gira_quitar_bots()
+        self.gira_recalcular_conquistadas()
 
     # ---------- infraestructura ----------
     def _conectar(self):
@@ -511,6 +512,24 @@ class Banco:
             q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (clave, cuenta_id, now))
             return {"ok": True, "premio": premio}
         return self._transaccion(trabajo)
+
+    def gira_recalcular_conquistadas(self):
+        """Al arrancar: vuelve a contar las regiones conquistadas de cada jugador con la regla actual
+        (así quien ya tenía victorias guardadas con una regla anterior aparece en el ranking sin esperar a su próxima jugada)."""
+        def trabajo(q):
+            cambiadas = 0
+            for cuenta, regs, conq in q("SELECT cuenta, regiones, conquistadas FROM gira").fetchall():
+                nuevo = sum(1 for v in self._gira_leer(regs).values() if v >= GIRA_VICTORIAS_REGION)
+                if nuevo != int(conq):
+                    q("UPDATE gira SET conquistadas = ? WHERE cuenta = ?", (nuevo, cuenta))
+                    cambiadas += 1
+            return cambiadas
+        try:
+            cambiadas = self._transaccion(trabajo)
+            if cambiadas:
+                print(f"[truco] Gira: se actualizaron las regiones conquistadas de {cambiadas} jugadores.")
+        except Exception as error:  # nunca debe impedir que el servidor arranque
+            print("[truco] Gira: no se pudo recalcular las regiones conquistadas:", error)
 
     def gira_sincronizar(self, cuenta_id, regiones, nombre="", club=""):
         """Alta única de quien ya venía jugando: reconstruye un mínimo de puntos desde sus regiones."""

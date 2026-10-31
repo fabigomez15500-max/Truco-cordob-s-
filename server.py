@@ -667,7 +667,6 @@ async def websocket_endpoint(ws: WebSocket):
             await cerrar_jugador(room_code, rooms[room_code], slot, ws)
 
 
-@contextlib.asynccontextmanager
 async def gira_auth(request):
     datos = await leer_json(request)
     cid = str(datos.get("id", "")).strip().upper()

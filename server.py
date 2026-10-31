@@ -7,7 +7,7 @@ Variables de entorno:
   APUESTA_MIN / APUESTA_MAX   Límites de apuesta (por defecto 10 y 100000).
 
 Monedas: el saldo vive en la base. Las apuestas se retienen al entrar a la sala y
-se liquidan una sola vez: gana quien llegó a 30 (si los dos celulares informan lo
+se liquidan una sola vez: gana quien llegó a 18 (si los dos celulares informan lo
 mismo), abandona = pierde, y si los reportes no coinciden se devuelven las apuestas.
 """
 import asyncio

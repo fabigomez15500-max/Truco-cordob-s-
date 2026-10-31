@@ -34,7 +34,13 @@ GIRA_PT = {
     "chi.sur": 1600, "chi.austral": 2000,
     "uru.norte": 1600, "uru.centro": 1800, "uru.costa": 2400,
 }
-GIRA_VICTORIAS_REGION = 2
+GIRA_VICTORIAS_REGION = 1  # igual que el juego: con un campeonato ganado se conquista la región
+
+# Gira Nacional: puntos de cada logro personal (espejo del cliente). Se cobran UNA sola vez por cuenta.
+GIRA_LOGROS_PT = {
+    "primera_victoria": 50, "ganador10": 100, "imparable": 200,
+    "primer_destino": 50, "explorador": 150, "cruce_internacional": 250,
+}
 
 # Jugadores simulados para que el podio y el Top 10 no estén vacíos.
 # (nombre, club, puntos al arrancar, puntos que suman por día, regiones conquistadas)
@@ -477,6 +483,32 @@ class Banco:
             self._gira_guardar(q, cuenta_id, nombre or nom or "Jugador", club or clb, int(puntos) + premio,
                                int(torneos) + 1, regiones, now)
             q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (evento_id, cuenta_id, now))
+            return {"ok": True, "premio": premio}
+        return self._transaccion(trabajo)
+
+    def gira_logro(self, cuenta_id, evento_id, logro_id, nombre="", club=""):
+        """Suma los puntos de un logro cumplido. El premio lo fija el servidor y cada logro se cobra una sola vez por cuenta."""
+        cuenta_id = str(cuenta_id).upper()
+        evento_id = str(evento_id)[:64]
+        logro_id = str(logro_id)[:40]
+        if logro_id not in GIRA_LOGROS_PT or not evento_id:
+            return {"error": "Logro inválido."}
+        clave = f"logro:{cuenta_id}:{logro_id}"  # evita cobrar dos veces el mismo logro aunque cambie el id del evento
+
+        def trabajo(q):
+            if (q("SELECT 1 FROM gira_eventos WHERE id = ?", (evento_id,)).fetchone()
+                    or q("SELECT 1 FROM gira_eventos WHERE id = ?", (clave,)).fetchone()):
+                return {"repetido": True}
+            now = int(time.time())
+            fila = q("SELECT nombre, club, puntos, torneos, regiones, ultimo FROM gira WHERE cuenta = ?",
+                     (cuenta_id,)).fetchone()
+            nom, clb, puntos, torneos, regs, ultimo = (fila if fila else ("", "", 0, 0, "", 0))
+            premio = GIRA_LOGROS_PT[logro_id]
+            # "ultimo" no se toca: los logros no cuentan para el tiempo mínimo entre victorias
+            self._gira_guardar(q, cuenta_id, nombre or nom or "Jugador", club or clb, int(puntos) + premio,
+                               int(torneos), self._gira_leer(regs), int(ultimo))
+            q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (evento_id, cuenta_id, now))
+            q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (clave, cuenta_id, now))
             return {"ok": True, "premio": premio}
         return self._transaccion(trabajo)
 

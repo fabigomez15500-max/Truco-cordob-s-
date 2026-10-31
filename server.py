@@ -720,6 +720,15 @@ async def gira_victoria(request):
     return JSONResponse(r, status_code=400 if "error" in r else 200)
 
 
+async def gira_logro(request):
+    cid, datos, error = await gira_auth(request)
+    if error:
+        return error
+    r = await db(banco.gira_logro, cid, str(datos.get("evento", "")), str(datos.get("logro", "")),
+                 str(datos.get("nombre", "")), str(datos.get("club", "")))
+    return JSONResponse(r, status_code=400 if "error" in r else 200)
+
+
 async def gira_sincronizar(request):
     cid, datos, error = await gira_auth(request)
     if error:
@@ -775,6 +784,7 @@ app = Starlette(
         Route("/apuesta/abrir", apuesta_abrir, methods=["POST"]),
         Route("/apuesta/reclamar", apuesta_reclamar, methods=["POST"]),
         Route("/gira/victoria", gira_victoria, methods=["POST"]),
+        Route("/gira/logro", gira_logro, methods=["POST"]),
         Route("/gira/sincronizar", gira_sincronizar, methods=["POST"]),
         Route("/gira/mi_estado", gira_mi_estado, methods=["POST"]),
         Route("/gira/podio", gira_podio),

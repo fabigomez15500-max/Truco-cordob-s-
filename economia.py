@@ -479,8 +479,10 @@ class Banco:
             if now - int(ultimo) < GIRA_ESPERA:
                 return {"error": "Victoria demasiado rápida; se reintentará."}
             regiones = self._gira_leer(regs)
+            ya_conquistada = regiones.get(region_clave, 0) >= GIRA_VICTORIAS_REGION
             regiones[region_clave] = min(GIRA_VICTORIAS_REGION, regiones.get(region_clave, 0) + 1)
-            premio = GIRA_PT[region_clave] // 2
+            # los puntos de una región se cobran solo la primera vez que se conquista; repetirla no suma
+            premio = 0 if ya_conquistada else GIRA_PT[region_clave] // 2
             self._gira_guardar(q, cuenta_id, nombre or nom or "Jugador", club or clb, int(puntos) + premio,
                                int(torneos) + 1, regiones, now)
             q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (evento_id, cuenta_id, now))

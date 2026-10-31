@@ -729,6 +729,20 @@ async def gira_logro(request):
     return JSONResponse(r, status_code=400 if "error" in r else 200)
 
 
+async def gira_descuento(request):
+    # Puntos que se pierden en un Desafío: se descuentan del ranking online (una sola vez por evento).
+    cid, datos, error = await gira_auth(request)
+    if error:
+        return error
+    try:
+        puntos = int(datos.get("puntos", 0))
+    except (TypeError, ValueError):
+        puntos = 0
+    r = await db(banco.gira_descuento, cid, str(datos.get("evento", "")), puntos, str(datos.get("motivo", "")),
+                 str(datos.get("nombre", "")), str(datos.get("club", "")))
+    return JSONResponse(r, status_code=400 if "error" in r else 200)
+
+
 async def gira_sincronizar(request):
     cid, datos, error = await gira_auth(request)
     if error:
@@ -785,6 +799,7 @@ app = Starlette(
         Route("/apuesta/reclamar", apuesta_reclamar, methods=["POST"]),
         Route("/gira/victoria", gira_victoria, methods=["POST"]),
         Route("/gira/logro", gira_logro, methods=["POST"]),
+        Route("/gira/descuento", gira_descuento, methods=["POST"]),
         Route("/gira/sincronizar", gira_sincronizar, methods=["POST"]),
         Route("/gira/mi_estado", gira_mi_estado, methods=["POST"]),
         Route("/gira/podio", gira_podio),

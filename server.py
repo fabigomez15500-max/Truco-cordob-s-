@@ -702,7 +702,12 @@ async def gira_mi_estado(request):
 
 
 async def gira_podio(request):
-    return JSONResponse(await db(banco.gira_podio, 3))
+    # ?limite=10 pide el Top 10; sin parámetro (apps viejas) sigue devolviendo el podio de 3
+    try:
+        limite = int(request.query_params.get("limite", 3))
+    except (TypeError, ValueError):
+        limite = 3
+    return JSONResponse(await db(banco.gira_podio, max(1, min(limite, 10))))
 
 
 async def lifespan(app):

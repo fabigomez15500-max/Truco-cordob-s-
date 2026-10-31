@@ -19,6 +19,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import unicodedata
 
 
 # Apuestas contra la IA / campeonato: el premio lo fija el servidor, no el celular.
@@ -127,6 +128,18 @@ class Banco:
                     id TEXT PRIMARY KEY, cuenta TEXT NOT NULL, fecha BIGINT NOT NULL)""")
             q("CREATE UNIQUE INDEX IF NOT EXISTS ix_cuentas_token ON cuentas (token_hash)")
         self._transaccion(trabajo)
+        self._asegurar_columna_club()
+
+    def _asegurar_columna_club(self):
+        """Cuentas viejas no tenían club: se agrega la columna sin perder nada."""
+        def trabajo(q):
+            if self.pg:
+                q("ALTER TABLE cuentas ADD COLUMN IF NOT EXISTS club TEXT NOT NULL DEFAULT ''")
+            else:
+                columnas = [f[1] for f in q("PRAGMA table_info(cuentas)").fetchall()]
+                if "club" not in columnas:
+                    q("ALTER TABLE cuentas ADD COLUMN club TEXT NOT NULL DEFAULT ''")
+        self._transaccion(trabajo)
 
     @property
     def tipo(self):
@@ -137,10 +150,11 @@ class Banco:
         return hashlib.sha256(token.encode()).hexdigest()
 
     # ---------- cuentas ----------
-    def crear_cuenta(self, nombre, token=None):
+    def crear_cuenta(self, nombre, token=None, club=""):
         """Crea una cuenta. Si el celular manda su propio token y ya existe, devuelve esa misma
         cuenta (así un reintento por mala conexión no crea una segunda cuenta)."""
         nombre = (nombre or "Jugador").strip()[:32] or "Jugador"
+        club = str(club or "").strip()[:40]
         token = str(token) if token is not None else None
         if token is not None and not 20 <= len(token) <= 100:
             token = None
@@ -152,15 +166,71 @@ class Banco:
             if propio:
                 fila = q("SELECT id FROM cuentas WHERE token_hash = ?", (th,)).fetchone()
                 if fila:
+                    if club:
+                        q("UPDATE cuentas SET club = ? WHERE id = ?", (club, fila[0]))
                     return fila[0]
             for _ in range(20):
                 cid = secrets.token_hex(4).upper()
                 if q("SELECT 1 FROM cuentas WHERE id = ?", (cid,)).fetchone() is None:
-                    q("INSERT INTO cuentas (id, token_hash, nombre, monedas, creada) VALUES (?, ?, ?, 0, ?)",
-                      (cid, th, nombre, int(time.time())))
+                    q("INSERT INTO cuentas (id, token_hash, nombre, club, monedas, creada) VALUES (?, ?, ?, ?, 0, ?)",
+                      (cid, th, nombre, club, int(time.time())))
                     return cid
             raise RuntimeError("no se pudo generar un ID")
         return self._transaccion(trabajo), token
+
+    # ---------- perfil público y búsqueda de jugadores ----------
+    @staticmethod
+    def _norm(texto):
+        """Minúsculas y sin tildes, para buscar 'Martín' escribiendo 'martin'."""
+        t = unicodedata.normalize("NFD", str(texto or "").lower())
+        return "".join(c for c in t if unicodedata.category(c) != "Mn").strip()
+
+    def actualizar_perfil(self, cuenta_id, nombre=None, club=None):
+        """Guarda nombre y club visibles para los amigos y la búsqueda."""
+        cuenta_id = str(cuenta_id).upper()
+        nombre = (str(nombre).strip()[:32] if nombre else "")
+        club = (str(club).strip()[:40] if club else "")
+
+        def trabajo(q):
+            if nombre:
+                q("UPDATE cuentas SET nombre = ? WHERE id = ?", (nombre, cuenta_id))
+            if club:
+                q("UPDATE cuentas SET club = ? WHERE id = ?", (club, cuenta_id))
+        self._transaccion(trabajo)
+        return {"ok": True}
+
+    def clubes_de(self, ids):
+        """{id: club} para una lista de cuentas (la lista de amigos muestra el escudo)."""
+        ids = [str(i).upper() for i in ids if i]
+        if not ids:
+            return {}
+
+        def trabajo(q):
+            filas = q("SELECT id, club FROM cuentas WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                      tuple(ids)).fetchall()
+            return {f[0]: f[1] or "" for f in filas}
+        return self._transaccion(trabajo)
+
+    def buscar_cuentas(self, excluir, palabras, club="", limite=20):
+        """Busca jugadores por nombre/apellido (cada palabra debe empezar alguna palabra del nombre) y club."""
+        excluir = str(excluir).upper()
+        palabras = [self._norm(p) for p in palabras if self._norm(p)]
+        club_n = self._norm(club)
+
+        def trabajo(q):
+            return q("SELECT id, nombre, club FROM cuentas WHERE id <> ? ORDER BY creada DESC LIMIT 5000",
+                     (excluir,)).fetchall()
+        encontrados = []
+        for cid, nombre, club_c in self._transaccion(trabajo):
+            tokens = self._norm(nombre).split()
+            if any(not any(t.startswith(p) for t in tokens) for p in palabras):
+                continue
+            if club_n and self._norm(club_c) != club_n:
+                continue
+            encontrados.append({"id": cid, "nombre": nombre, "club": club_c or ""})
+            if len(encontrados) >= limite:
+                break
+        return encontrados
 
     def autenticar(self, cuenta_id, token):
         if not cuenta_id or not token:

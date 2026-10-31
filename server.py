@@ -291,7 +291,8 @@ async def registrar(request):
     recientes.append(ahora)
     registros_por_ip[ip] = recientes
     datos = await leer_json(request)
-    cid, token = await db(banco.crear_cuenta, str(datos.get("name", "Jugador")), datos.get("token"))
+    cid, token = await db(banco.crear_cuenta, str(datos.get("name", "Jugador")), datos.get("token"),
+                          str(datos.get("club", "")))
     return JSONResponse({"id": cid, "token": token, "coins": 0})
 
 
@@ -330,7 +331,42 @@ async def amigos_listar(request):
     cid, datos, error = await amigos_auth(request)
     if error:
         return error
-    return JSONResponse(await db(social.listar, cid))
+    r = await db(social.listar, cid)
+    # Agrega el club de cada uno para que la app muestre su escudo.
+    grupos = [r.get(k) or [] for k in ("amigos", "recibidas", "enviadas")]
+    clubes = await db(banco.clubes_de, [x.get("id") for g in grupos for x in g])
+    for g in grupos:
+        for x in g:
+            x["club"] = clubes.get(str(x.get("id", "")).upper(), "")
+    return JSONResponse(r)
+
+
+async def cuenta_perfil(request):
+    """El celular informa su nombre y club para que los amigos vean el escudo y lo encuentren."""
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    return JSONResponse(await db(banco.actualizar_perfil, cid, datos.get("nombre"), datos.get("club")))
+
+
+async def amigos_buscar(request):
+    """Busca jugadores por nombre, apellido y/o club para mandarles solicitud de amistad."""
+    cid, datos, error = await amigos_auth(request)
+    if error:
+        return error
+    palabras = (str(datos.get("nombre", "")) + " " + str(datos.get("apellido", ""))).split()[:6]
+    club = str(datos.get("club", "")).strip()
+    if not club and not any(len(p) >= 2 for p in palabras):
+        return JSONResponse({"error": "Escribí al menos 2 letras del nombre o apellido, o elegí un club."}, status_code=400)
+    encontrados = await db(banco.buscar_cuentas, cid, palabras, club)
+    rel = await db(social.listar, cid)
+    estado = {}
+    for clave, nombre_rel in (("amigos", "amigo"), ("enviadas", "enviada"), ("recibidas", "recibida")):
+        for x in rel.get(clave) or []:
+            estado[str(x.get("id", "")).upper()] = nombre_rel
+    for x in encontrados:
+        x["relacion"] = estado.get(x["id"], "")
+    return JSONResponse({"resultados": encontrados})
 
 
 async def amigos_pedir(request):
@@ -727,6 +763,8 @@ app = Starlette(
         Route("/room/{code}", info_sala),
         Route("/amigos/latido", amigos_latido, methods=["POST"]),
         Route("/amigos/listar", amigos_listar, methods=["POST"]),
+        Route("/amigos/buscar", amigos_buscar, methods=["POST"]),
+        Route("/cuenta/perfil", cuenta_perfil, methods=["POST"]),
         Route("/amigos/pedir", amigos_pedir, methods=["POST"]),
         Route("/amigos/responder", amigos_responder, methods=["POST"]),
         Route("/amigos/eliminar", amigos_eliminar, methods=["POST"]),

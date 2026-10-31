@@ -34,6 +34,24 @@ GIRA_PT = {
     "uru.norte": 1600, "uru.centro": 1800, "uru.costa": 2400,
 }
 GIRA_VICTORIAS_REGION = 2
+
+# Jugadores simulados para que el podio y el Top 10 no estén vacíos.
+# (nombre, club, puntos al arrancar, puntos que suman por día, regiones conquistadas)
+# Los puntos crecen solos con los días (hasta GIRA_BOTS_TOPE sobre el inicial) para que parezcan jugadores activos.
+# Para apagarlos: variable de entorno TRUCO_BOTS=0 en Render (se borran del ranking al reiniciar).
+GIRA_BOTS = [
+    ("Facu_Cba", "Talleres de Córdoba", 4300, 70, 9),
+    ("ElTanoRC", "Rosario Central", 3800, 60, 8),
+    ("Maxi Truco", "Boca Juniors", 3300, 80, 7),
+    ("Lucho_10", "River Plate", 2900, 55, 6),
+    ("NachoRacing", "Racing Club", 2500, 65, 6),
+    ("Gringo_Bel", "Belgrano de Córdoba", 2100, 50, 5),
+    ("PabloVelez", "Vélez Sarsfield", 1700, 45, 4),
+    ("Cande_Pincha", "Estudiantes de La Plata", 1300, 40, 3),
+    ("Mati_Lanús", "Lanús", 900, 35, 2),
+    ("Rodri_Funes", "Newell's Old Boys", 600, 30, 1),
+]
+GIRA_BOTS_TOPE = 1500
 GIRA_ESPERA = 60  # segundos mínimos entre dos victorias informadas
 
 
@@ -49,6 +67,10 @@ class Banco:
             self._mem = sqlite3.connect(":memory:", check_same_thread=False)
         self._lock = threading.Lock()  # SQLite: una escritura a la vez
         self._crear_tablas()
+        if os.environ.get("TRUCO_BOTS", "1").strip() != "0":
+            self.gira_sembrar_bots()
+        else:
+            self.gira_quitar_bots()
 
     # ---------- infraestructura ----------
     def _conectar(self):
@@ -409,9 +431,45 @@ class Banco:
             return {"ok": True}
         return self._transaccion(trabajo)
 
+    @staticmethod
+    def _bots_ids():
+        return ["BOT%02d" % (i + 1) for i in range(len(GIRA_BOTS))]
+
+    def gira_sembrar_bots(self):
+        """Crea (una sola vez) los jugadores simulados del ranking."""
+        def trabajo(q):
+            ahora = int(time.time())
+            for i, (nombre, club, base, _ritmo, n) in enumerate(GIRA_BOTS):
+                cuenta = self._bots_ids()[i]
+                if q("SELECT 1 FROM gira WHERE cuenta = ?", (cuenta,)).fetchone():
+                    continue
+                regiones = {k: GIRA_VICTORIAS_REGION for k in list(GIRA_PT)[:n]}
+                q("INSERT INTO gira (nombre, club, puntos, torneos, regiones, conquistadas, ultimo, cuenta, desde) "
+                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (nombre[:24], club[:40], base, n * 2, self._gira_escribir(regiones), n, 0, cuenta, ahora - i))
+        self._transaccion(trabajo)
+
+    def gira_quitar_bots(self):
+        ids = self._bots_ids()
+        self._transaccion(lambda q: q("DELETE FROM gira WHERE cuenta IN (%s)" % ",".join("?" * len(ids)), tuple(ids)))
+
+    def _bots_avanzar(self, q):
+        """Los simulados suman puntos con el paso de los días (cuenta desde que se crearon)."""
+        ids = self._bots_ids()
+        filas = q("SELECT cuenta, desde, puntos FROM gira WHERE cuenta IN (%s)" % ",".join("?" * len(ids)),
+                  tuple(ids)).fetchall()
+        ahora = time.time()
+        for cuenta, desde, puntos in filas:
+            i = ids.index(cuenta)
+            _n, _c, base, ritmo, _r = GIRA_BOTS[i]
+            nuevo = base + min(GIRA_BOTS_TOPE, int((ahora - int(desde)) / 86400.0 * ritmo))
+            if nuevo != int(puntos):
+                q("UPDATE gira SET puntos = ? WHERE cuenta = ?", (nuevo, cuenta))
+
     def gira_podio(self, limite=3):
         """Los mejores por puntos entre quienes conquistaron al menos 1 región."""
         def trabajo(q):
+            self._bots_avanzar(q)
             filas = q("SELECT nombre, club, puntos, conquistadas FROM gira WHERE conquistadas >= 1 "
                       "ORDER BY puntos DESC, desde ASC LIMIT ?", (int(limite),)).fetchall()
             total = q("SELECT COUNT(*) FROM gira WHERE conquistadas >= 1").fetchone()[0]
@@ -424,6 +482,7 @@ class Banco:
         cuenta_id = str(cuenta_id).upper()
 
         def trabajo(q):
+            self._bots_avanzar(q)
             fila = q("SELECT puntos, conquistadas, torneos, desde FROM gira WHERE cuenta = ?", (cuenta_id,)).fetchone()
             total = int(q("SELECT COUNT(*) FROM gira WHERE conquistadas >= 1").fetchone()[0])
             if not fila:

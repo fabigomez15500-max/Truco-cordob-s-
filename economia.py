@@ -58,6 +58,11 @@ GIRA_BOTS = [
     ("Mati_Lanús", "Lanús", 900, 35, 2),
     ("Rodri_Funes", "Newell's Old Boys", 600, 30, 1),
 ]
+# Truco del día: una victoria por día (fecha de Argentina, la fija el servidor). 150 pts + 25 por cada día seguido, tope 6 extras.
+DIA_PUNTOS_BASE = 150
+DIA_PUNTOS_RACHA = 25
+DIA_RACHA_TOPE = 6
+DIA_LOGRO_ID = "truco_del_dia"
 GIRA_BOTS_TOPE = 1500
 GIRA_ESPERA = 60  # segundos mínimos entre dos victorias informadas
 
@@ -133,6 +138,9 @@ class Banco:
                     ultimo BIGINT NOT NULL DEFAULT 0, desde BIGINT NOT NULL DEFAULT 0)""")
             q("""CREATE TABLE IF NOT EXISTS gira_eventos (
                     id TEXT PRIMARY KEY, cuenta TEXT NOT NULL, fecha BIGINT NOT NULL)""")
+            q("""CREATE TABLE IF NOT EXISTS gira_dia (
+                    cuenta TEXT PRIMARY KEY, ultima TEXT NOT NULL DEFAULT '', racha INTEGER NOT NULL DEFAULT 0,
+                    ganados INTEGER NOT NULL DEFAULT 0)""")
             q("CREATE UNIQUE INDEX IF NOT EXISTS ix_cuentas_token ON cuentas (token_hash)")
         self._transaccion(trabajo)
         self._asegurar_columna_club()
@@ -513,6 +521,47 @@ class Banco:
             q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (evento_id, cuenta_id, now))
             q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (clave, cuenta_id, now))
             return {"ok": True, "premio": premio}
+        return self._transaccion(trabajo)
+
+    @staticmethod
+    def _fecha_argentina(desfase_dias=0):
+        """'AAAA-MM-DD' en Argentina (UTC-3, sin horario de verano). La fecha la pone el servidor, no el celular."""
+        return time.strftime("%Y-%m-%d", time.gmtime(time.time() - 3 * 3600 + 86400 * desfase_dias))
+
+    def gira_truco_dia(self, cuenta_id, evento_id, nombre="", club=""):
+        """Suma los puntos de ganar el Truco del día. Una sola vez por cuenta y por día; la racha y el premio los
+        calcula el servidor (el celular no puede pedir más puntos ni repetir el día)."""
+        cuenta_id = str(cuenta_id).upper()
+        evento_id = str(evento_id)[:64]
+        if not evento_id:
+            return {"error": "Evento inválido."}
+        hoy, ayer = self._fecha_argentina(0), self._fecha_argentina(-1)
+        clave = f"dia:{cuenta_id}:{hoy}"
+
+        def trabajo(q):
+            if (q("SELECT 1 FROM gira_eventos WHERE id = ?", (evento_id,)).fetchone()
+                    or q("SELECT 1 FROM gira_eventos WHERE id = ?", (clave,)).fetchone()):
+                return {"repetido": True}
+            now = int(time.time())
+            fila = q("SELECT ultima, racha, ganados FROM gira_dia WHERE cuenta = ?", (cuenta_id,)).fetchone()
+            ultima, racha, ganados = (fila[0], int(fila[1]), int(fila[2])) if fila else ("", 0, 0)
+            racha = racha + 1 if ultima == ayer else 1
+            premio = DIA_PUNTOS_BASE + DIA_PUNTOS_RACHA * min(racha - 1, DIA_RACHA_TOPE)
+            if fila:
+                q("UPDATE gira_dia SET ultima = ?, racha = ?, ganados = ? WHERE cuenta = ?",
+                  (hoy, racha, ganados + 1, cuenta_id))
+            else:
+                q("INSERT INTO gira_dia (cuenta, ultima, racha, ganados) VALUES (?, ?, ?, ?)",
+                  (cuenta_id, hoy, racha, 1))
+            g = q("SELECT nombre, club, puntos, torneos, regiones, ultimo FROM gira WHERE cuenta = ?",
+                  (cuenta_id,)).fetchone()
+            nom, clb, puntos, torneos, regs, ultimo = (g if g else ("", "", 0, 0, "", 0))
+            # "ultimo" no se toca: el Truco del día no cuenta para el tiempo mínimo entre victorias
+            self._gira_guardar(q, cuenta_id, nombre or nom or "Jugador", club or clb, int(puntos) + premio,
+                               int(torneos), self._gira_leer(regs), int(ultimo))
+            q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (evento_id, cuenta_id, now))
+            q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (clave, cuenta_id, now))
+            return {"ok": True, "premio": premio, "racha": racha, "fecha": hoy}
         return self._transaccion(trabajo)
 
     def gira_recalcular_conquistadas(self):

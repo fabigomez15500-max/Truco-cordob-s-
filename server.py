@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from economia import Banco, DIA_LOGRO_ID
+from economia import Banco, DIA_LOGRO_ID, poderes_ofertas
 from social import Social
 
 banco = Banco()
@@ -264,7 +264,9 @@ async def cerrar_jugador(room_code, room, slot, ws):
 async def health(request):
     return JSONResponse({"status": "ok", "service": "Truco Cordobes Online", "rooms": len(rooms),
                          "db": banco.tipo, "persistente": banco.pg,
-                         "database_url_cargada": banco.url_cargada})
+                         "database_url_cargada": banco.url_cargada,
+                         "poderes_comprar": True, "gira_descuento": hasattr(banco, "gira_descuento"),
+                         "poderes_ofertas_hoy": list(poderes_ofertas())})
 
 
 async def leer_json(request):

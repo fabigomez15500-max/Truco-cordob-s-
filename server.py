@@ -463,6 +463,20 @@ async def apuesta_reclamar(request):
     return JSONResponse(resultado)
 
 
+async def poderes_comprar(request):
+    """Compra de un poder: el servidor calcula el precio (con la oferta del día) y lo cobra una sola vez por `evento`."""
+    datos = await leer_json(request)
+    cid = str(datos.get("id", "")).strip().upper()
+    if not await db(banco.autenticar, cid, str(datos.get("token", ""))):
+        return JSONResponse({"error": "Cuenta inválida."}, status_code=401)
+    try:
+        visto = int(datos["precio"]) if datos.get("precio") is not None else None
+    except (TypeError, ValueError):
+        visto = None
+    r = await db(banco.comprar_poder, cid, str(datos.get("poder", "")), str(datos.get("evento", "")), visto)
+    return JSONResponse(r, status_code=400 if "error" in r else 200)
+
+
 def admin_ok(request):
     if not ADMIN_KEY:
         return JSONResponse({"error": "Administración apagada: falta ADMIN_KEY en el servidor."}, status_code=503)
@@ -802,6 +816,7 @@ app = Starlette(
         Route("/chat/invitacion", chat_invitacion, methods=["POST"]),
         Route("/apuesta/abrir", apuesta_abrir, methods=["POST"]),
         Route("/apuesta/reclamar", apuesta_reclamar, methods=["POST"]),
+        Route("/poderes/comprar", poderes_comprar, methods=["POST"]),
         Route("/gira/victoria", gira_victoria, methods=["POST"]),
         Route("/gira/logro", gira_logro, methods=["POST"]),
         Route("/gira/descuento", gira_descuento, methods=["POST"]),

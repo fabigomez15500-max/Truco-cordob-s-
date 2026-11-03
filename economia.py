@@ -63,7 +63,40 @@ DIA_PUNTOS_BASE = 150
 DIA_PUNTOS_RACHA = 25
 DIA_RACHA_TOPE = 6
 DIA_LOGRO_ID = "truco_del_dia"
+# Poderes de la Gira: el servidor fija el precio (el celular no puede pagar menos). Mismo orden que PODERES del cliente:
+# la oferta del día se elige por la fecha de Argentina y tiene que dar el mismo resultado en el celular y acá.
+PODERES_PRECIO = [("mago", 150), ("cientifico", 100), ("detective", 50), ("fenix", 150), ("soplon", 50),
+                  ("espia", 50), ("escudo", 100), ("silencio", 150), ("ancho", 150), ("halcon", 100),
+                  ("baqueano", 50), ("chaleco", 100), ("comodin", 150), ("pase", 150)]
+PODER_DESCUENTO = 50  # % de descuento del poder en oferta
+
+
+def poderes_ofertas(fecha=None):
+    """(id con descuento, id con 2x1) de la fecha 'AAAA-MM-DD' de Argentina (hoy si no se indica).
+    Misma cuenta que el cliente: random.Random(ordinal) / random.Random(ordinal * 7919 + 1)."""
+    import datetime
+    import random
+    fecha = fecha or Banco._fecha_argentina(0)
+    hoy = datetime.date.fromisoformat(fecha).toordinal()
+    ids = [p for p, _ in PODERES_PRECIO]
+    descuento = random.Random(hoy).choice(ids)
+    dos_por_uno = random.Random(hoy * 7919 + 1).choice([p for p in ids if p != descuento])
+    return descuento, dos_por_uno
+
+
+def poder_precio(poder_id, fecha=None):
+    """(precio a cobrar hoy, tipo de oferta) del poder; (None, None) si no existe."""
+    base = dict(PODERES_PRECIO).get(poder_id)
+    if base is None:
+        return None, None
+    descuento, dos_por_uno = poderes_ofertas(fecha)
+    if poder_id == descuento:
+        return max(1, base * (100 - PODER_DESCUENTO) // 100), "descuento"
+    return base, ("2x1" if poder_id == dos_por_uno else None)
+
+
 GIRA_BOTS_TOPE = 1500
+GIRA_DESCUENTO_TOPE = 5000  # máximo de puntos que se pueden restar en un solo descuento
 GIRA_ESPERA = 60  # segundos mínimos entre dos victorias informadas
 
 
@@ -352,6 +385,40 @@ class Banco:
             self.liquidar(sala, None)
         return len(salas)
 
+    # ---------- compra de poderes ----------
+    def comprar_poder(self, cuenta_id, poder_id, evento, precio_visto=None):
+        """Cobra un poder al precio que fija el servidor (con la oferta del día). No toca los tickets de apuesta:
+        comprar un poder en medio de un campeonato no cierra la apuesta abierta. El `evento` evita cobrar dos veces
+        si el celular reintenta por una mala conexión. Devuelve {coins, precio, oferta, regalo} o {error}."""
+        cuenta_id = str(cuenta_id).upper()
+        poder_id = str(poder_id)
+        evento = str(evento)[:64]
+        if not evento:
+            return {"error": "Compra inválida."}
+        precio, oferta = poder_precio(poder_id)
+        if precio is None:
+            return {"error": "Poder inexistente."}
+        if precio_visto is not None and int(precio_visto) != precio:
+            # el celular mostraba otro precio (cambió el día o la oferta): no se cobra, se le informa el real
+            return {"error": "El precio cambió. Ahora cuesta %d monedas." % precio, "precio": precio, "oferta": oferta}
+        clave = f"poder:{cuenta_id}:{evento}"
+
+        def trabajo(q):
+            if q("SELECT 1 FROM gira_eventos WHERE id = ?", (clave,)).fetchone():
+                saldo = int(q("SELECT monedas FROM cuentas WHERE id = ?", (cuenta_id,)).fetchone()[0])
+                return {"repetido": True, "coins": saldo, "precio": precio, "oferta": oferta, "regalo": oferta == "2x1"}
+            cur = q("UPDATE cuentas SET monedas = monedas - ? WHERE id = ? AND monedas >= ?",
+                    (precio, cuenta_id, precio))
+            if cur.rowcount != 1:
+                return {"error": "Saldo insuficiente: el poder cuesta %d monedas." % precio, "precio": precio, "oferta": oferta}
+            now = int(time.time())
+            q("INSERT INTO movimientos (cuenta, delta, motivo, ref, fecha) VALUES (?, ?, 'compra_poder', ?, ?)",
+              (cuenta_id, -precio, poder_id + (":" + oferta if oferta else ""), now))
+            q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (clave, cuenta_id, now))
+            saldo = int(q("SELECT monedas FROM cuentas WHERE id = ?", (cuenta_id,)).fetchone()[0])
+            return {"ok": True, "coins": saldo, "precio": precio, "oferta": oferta, "regalo": oferta == "2x1"}
+        return self._transaccion(trabajo)
+
     # ---------- apuestas contra la IA y campeonato (tickets) ----------
     def _devolver_ticket(self, ticket):
         def trabajo(q):
@@ -562,6 +629,37 @@ class Banco:
             q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (evento_id, cuenta_id, now))
             q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (clave, cuenta_id, now))
             return {"ok": True, "premio": premio, "racha": racha, "fecha": hoy}
+        return self._transaccion(trabajo)
+
+    def gira_descuento(self, cuenta_id, evento_id, puntos, motivo="desafio", nombre="", club=""):
+        """Resta del ranking los puntos que se pierden en un Desafío. Una sola vez por evento (los reintentos del celular
+        no vuelven a descontar) y nunca deja los puntos por debajo de 0."""
+        cuenta_id = str(cuenta_id).upper()
+        evento_id = str(evento_id)[:64]
+        try:
+            puntos = int(puntos)
+        except (TypeError, ValueError):
+            puntos = 0
+        if not evento_id or puntos <= 0 or puntos > GIRA_DESCUENTO_TOPE:
+            return {"error": "Descuento inválido."}
+        if str(motivo) != "desafio":
+            return {"error": "Motivo inválido."}
+
+        def trabajo(q):
+            if q("SELECT 1 FROM gira_eventos WHERE id = ?", (evento_id,)).fetchone():
+                return {"repetido": True}
+            now = int(time.time())
+            fila = q("SELECT nombre, club, puntos, torneos, regiones, ultimo FROM gira WHERE cuenta = ?",
+                     (cuenta_id,)).fetchone()
+            q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (evento_id, cuenta_id, now))
+            if not fila:
+                return {"ok": True, "descontado": 0}   # todavía sin puntos en el ranking: no hay nada que restar
+            nom, clb, actuales, torneos, regs, ultimo = fila
+            nuevos = max(0, int(actuales) - puntos)
+            # "ultimo" no se toca: un descuento no cuenta para el tiempo mínimo entre victorias
+            self._gira_guardar(q, cuenta_id, nombre or nom or "Jugador", club or clb, nuevos,
+                               int(torneos), self._gira_leer(regs), int(ultimo))
+            return {"ok": True, "descontado": int(actuales) - nuevos}
         return self._transaccion(trabajo)
 
     def gira_recalcular_conquistadas(self):

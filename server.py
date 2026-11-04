@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from economia import Banco, DIA_LOGRO_ID, poderes_ofertas
+from economia import Banco, DIA_LOGRO_ID, RULETA_LOGRO_PUNTOS, poderes_ofertas
 from social import Social
 
 banco = Banco()
@@ -743,6 +743,11 @@ async def gira_logro(request):
     if str(datos.get("logro", "")) == DIA_LOGRO_ID:
         # Truco del día: se puede repetir una vez por día; el premio y la fecha los calcula el servidor
         r = await db(banco.gira_truco_dia, cid, str(datos.get("evento", "")),
+                     str(datos.get("nombre", "")), str(datos.get("club", "")))
+        return JSONResponse(r, status_code=400 if "error" in r else 200)
+    if str(datos.get("logro", "")) in RULETA_LOGRO_PUNTOS:
+        # Ruleta: los puntos del casillero y el tope de giros por día los fija el servidor
+        r = await db(banco.gira_ruleta, cid, str(datos.get("evento", "")), str(datos.get("logro", "")),
                      str(datos.get("nombre", "")), str(datos.get("club", "")))
         return JSONResponse(r, status_code=400 if "error" in r else 200)
     r = await db(banco.gira_logro, cid, str(datos.get("evento", "")), str(datos.get("logro", "")),

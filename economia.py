@@ -19,6 +19,8 @@ import secrets
 import sqlite3
 import threading
 import time
+
+import ranking
 import unicodedata
 
 
@@ -185,6 +187,25 @@ class Banco:
             q("""CREATE TABLE IF NOT EXISTS gira_dia (
                     cuenta TEXT PRIMARY KEY, ultima TEXT NOT NULL DEFAULT '', racha INTEGER NOT NULL DEFAULT 0,
                     ganados INTEGER NOT NULL DEFAULT 0)""")
+            q("""CREATE TABLE IF NOT EXISTS semanal (
+                    semana TEXT NOT NULL, cuenta TEXT NOT NULL, nombre TEXT NOT NULL, club TEXT NOT NULL DEFAULT '',
+                    puntos BIGINT NOT NULL DEFAULT 0, partidas INTEGER NOT NULL DEFAULT 0,
+                    victorias INTEGER NOT NULL DEFAULT 0, racha INTEGER NOT NULL DEFAULT 0,
+                    ultimo BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (semana, cuenta))""")
+            q("""CREATE TABLE IF NOT EXISTS semanal_cruces (
+                    semana TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (semana, a, b))""")
+            q("CREATE TABLE IF NOT EXISTS semanal_eventos (id TEXT PRIMARY KEY, fecha BIGINT NOT NULL)")
+            q("""CREATE TABLE IF NOT EXISTS semanal_ia (
+                    cuenta TEXT NOT NULL, dia TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
+                    ultimo BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (cuenta, dia))""")
+            q("""CREATE TABLE IF NOT EXISTS semanal_misiones (
+                    semana TEXT NOT NULL, cuenta TEXT NOT NULL, clave TEXT NOT NULL,
+                    progreso INTEGER NOT NULL DEFAULT 0, cobrada INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (semana, cuenta, clave))""")
+            q("""CREATE TABLE IF NOT EXISTS semanal_campeones (
+                    semana TEXT NOT NULL, puesto INTEGER NOT NULL, cuenta TEXT NOT NULL, nombre TEXT NOT NULL,
+                    club TEXT NOT NULL DEFAULT '', puntos BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (semana, puesto))""")
             q("CREATE UNIQUE INDEX IF NOT EXISTS ix_cuentas_token ON cuentas (token_hash)")
         self._transaccion(trabajo)
         self._asegurar_columna_club()
@@ -419,6 +440,228 @@ class Banco:
                 perdidas[f[1]] = perdidas.get(f[1], 0) + int(f[2])
                 q("UPDATE retenciones SET abierta = 0 WHERE id = ?", (f[0],))
             return perdidas
+        return self._transaccion(trabajo)
+
+    # ---------- ranking semanal (sin monedas: solo prestigio) ----------
+    def _semanal_fila(self, q, semana, cuenta, ahora):
+        """(puntos, partidas, victorias, racha) de la cuenta en la semana; la crea si falta y refresca nombre/club."""
+        c = q("SELECT nombre, club FROM cuentas WHERE id = ?", (cuenta,)).fetchone()
+        nombre, club = (c[0], c[1] or "") if c else ("Jugador", "")
+        f = q("SELECT puntos, partidas, victorias, racha FROM semanal WHERE semana = ? AND cuenta = ?",
+              (semana, cuenta)).fetchone()
+        if f is None:
+            q("INSERT INTO semanal (semana, cuenta, nombre, club, ultimo) VALUES (?, ?, ?, ?, ?)",
+              (semana, cuenta, nombre, club, int(ahora)))
+            return (0, 0, 0, 0)
+        q("UPDATE semanal SET nombre = ?, club = ? WHERE semana = ? AND cuenta = ?", (nombre, club, semana, cuenta))
+        return tuple(int(x) for x in f)
+
+    def _diario_sumar(self, q, cuenta, pts, partida, ahora):
+        """El ranking diario es el mismo sistema con la clave 'D:AAAA-MM-DD'."""
+        clave = "D:" + ranking.dia_clave(ahora)
+        self._semanal_fila(q, clave, cuenta, ahora)
+        q("UPDATE semanal SET puntos = puntos + ?, partidas = partidas + ?, ultimo = ? WHERE semana = ? AND cuenta = ?",
+          (int(pts), 1 if partida else 0, int(ahora), clave, cuenta))
+
+    def _mision(self, q, semana, cuenta, clave, valor, ahora, absoluto=False):
+        """Avanza una misión semanal. Devuelve {'clave','titulo','premio'} si se cumple justo ahora."""
+        meta, premio, titulo = ranking.MISIONES[clave]
+        f = q("SELECT progreso, cobrada FROM semanal_misiones WHERE semana = ? AND cuenta = ? AND clave = ?",
+              (semana, cuenta, clave)).fetchone()
+        if f is None:
+            q("INSERT INTO semanal_misiones (semana, cuenta, clave, progreso, cobrada) VALUES (?, ?, ?, 0, 0)",
+              (semana, cuenta, clave))
+            progreso, cobrada = 0, 0
+        else:
+            progreso, cobrada = int(f[0]), int(f[1])
+        if cobrada:
+            return None
+        nuevo = min(meta, max(progreso, valor) if absoluto else progreso + valor)
+        cumple = nuevo >= meta
+        q("UPDATE semanal_misiones SET progreso = ?, cobrada = ? WHERE semana = ? AND cuenta = ? AND clave = ?",
+          (nuevo, 1 if cumple else 0, semana, cuenta, clave))
+        if not cumple:
+            return None
+        q("UPDATE semanal SET puntos = puntos + ? WHERE semana = ? AND cuenta = ?", (premio, semana, cuenta))
+        self._diario_sumar(q, cuenta, premio, False, ahora)
+        return {"clave": clave, "titulo": titulo, "premio": premio}
+
+    def semanal_mision(self, cuenta, clave, valor=1, ahora=None):
+        """Avanza una misión desde afuera (p. ej. terminar un torneo). Devuelve la misión cumplida o None."""
+        cuenta = str(cuenta).upper()
+        ahora = time.time() if ahora is None else ahora
+        semana = ranking.semana_clave(ahora)
+
+        def trabajo(q):
+            self._semanal_fila(q, semana, cuenta, ahora)
+            return self._mision(q, semana, cuenta, clave, valor, ahora)
+        return self._transaccion(trabajo)
+
+    def semanal_partida(self, evento, a, b, ganador, margen=0, apuesta=0, ahora=None):
+        """Suma los puntos de una partida entre dos personas.
+
+        Devuelve {cuenta: {"puntos": n, "misiones": [misiones cumplidas]}} ({} si la partida no cuenta).
+        """
+        a, b, ganador = str(a).upper(), str(b).upper(), str(ganador).upper()
+        ahora = time.time() if ahora is None else ahora
+        semana = ranking.semana_clave(ahora)
+
+        def trabajo(q):
+            if q("SELECT 1 FROM semanal_eventos WHERE id = ?", (evento,)).fetchone():
+                return {}
+            q("INSERT INTO semanal_eventos (id, fecha) VALUES (?, ?)", (evento, int(ahora)))
+            par = tuple(sorted((a, b)))
+            fila = q("SELECT n FROM semanal_cruces WHERE semana = ? AND a = ? AND b = ?", (semana,) + par).fetchone()
+            n = int(fila[0]) if fila else 0
+            if n >= ranking.MAX_CRUCES_SEMANA:
+                return {}
+            if fila:
+                q("UPDATE semanal_cruces SET n = n + 1 WHERE semana = ? AND a = ? AND b = ?", (semana,) + par)
+            else:
+                q("INSERT INTO semanal_cruces (semana, a, b, n) VALUES (?, ?, ?, 1)", (semana,) + par)
+            antes = {c: self._semanal_fila(q, semana, c, ahora) for c in (a, b)}
+            pagos = {}
+            for c, rival in ((a, b), (b, a)):
+                pts, _partidas, _vic, racha = antes[c]
+                gano = c == ganador
+                racha_nueva = racha + 1 if gano else 0
+                p = ranking.puntos_partida(gano, margen, racha_nueva, antes[rival][0] > pts, apuesta)
+                q("UPDATE semanal SET puntos = puntos + ?, partidas = partidas + 1, victorias = victorias + ?, "
+                  "racha = ?, ultimo = ? WHERE semana = ? AND cuenta = ?",
+                  (p, 1 if gano else 0, racha_nueva, int(ahora), semana, c))
+                self._diario_sumar(q, c, p, True, ahora)
+                cumplidas = []
+                for clave, valor, absoluto in (("jugar10", 1, False), ("ganar5", 1 if gano else 0, False),
+                                               ("racha3", racha_nueva, True),
+                                               ("apuesta1", 1 if (gano and apuesta and apuesta > 0) else 0, False)):
+                    if valor:
+                        m = self._mision(q, semana, c, clave, valor, ahora, absoluto)
+                        if m:
+                            cumplidas.append(m)
+                pagos[c] = {"puntos": p, "misiones": cumplidas}
+            return pagos
+        return self._transaccion(trabajo)
+
+    def semanal_sumar(self, cuenta, puntos, evento, ahora=None):
+        """Suma puntos sueltos (premios de torneo). Una sola vez por `evento`. Devuelve los puntos sumados."""
+        cuenta = str(cuenta).upper()
+        ahora = time.time() if ahora is None else ahora
+        semana = ranking.semana_clave(ahora)
+
+        def trabajo(q):
+            if q("SELECT 1 FROM semanal_eventos WHERE id = ?", (evento,)).fetchone():
+                return 0
+            q("INSERT INTO semanal_eventos (id, fecha) VALUES (?, ?)", (evento, int(ahora)))
+            self._semanal_fila(q, semana, cuenta, ahora)
+            q("UPDATE semanal SET puntos = puntos + ?, ultimo = ? WHERE semana = ? AND cuenta = ?",
+              (int(puntos), int(ahora), semana, cuenta))
+            self._diario_sumar(q, cuenta, puntos, False, ahora)
+            return int(puntos)
+        return self._transaccion(trabajo)
+
+    def semanal_ia(self, cuenta, evento, minimo_segundos=60, ahora=None):
+        """+1 por ganarle a la IA: hasta IA_TOPE_DIA por día y separadas por `minimo_segundos`."""
+        cuenta = str(cuenta).upper()
+        ahora = time.time() if ahora is None else ahora
+        semana, dia = ranking.semana_clave(ahora), ranking.dia_clave(ahora)
+
+        def trabajo(q):
+            if q("SELECT 1 FROM semanal_eventos WHERE id = ?", (evento,)).fetchone():
+                return {"error": "Resultado repetido."}
+            f = q("SELECT n, ultimo FROM semanal_ia WHERE cuenta = ? AND dia = ?", (cuenta, dia)).fetchone()
+            if f and (int(f[0]) >= ranking.IA_TOPE_DIA or ahora - int(f[1]) < minimo_segundos):
+                return {"puntos": 0}
+            q("INSERT INTO semanal_eventos (id, fecha) VALUES (?, ?)", (evento, int(ahora)))
+            if f:
+                q("UPDATE semanal_ia SET n = n + 1, ultimo = ? WHERE cuenta = ? AND dia = ?", (int(ahora), cuenta, dia))
+            else:
+                q("INSERT INTO semanal_ia (cuenta, dia, n, ultimo) VALUES (?, ?, 1, ?)", (cuenta, dia, int(ahora)))
+            self._semanal_fila(q, semana, cuenta, ahora)
+            q("UPDATE semanal SET puntos = puntos + ?, ultimo = ? WHERE semana = ? AND cuenta = ?",
+              (ranking.PTS_IA, int(ahora), semana, cuenta))
+            self._diario_sumar(q, cuenta, ranking.PTS_IA, False, ahora)
+            return {"puntos": ranking.PTS_IA}
+        return self._transaccion(trabajo)
+
+    def _archivar_semanas(self, q, semana_actual):
+        """Guarda el podio de cada semana ya cerrada (una sola vez): de ahí salen los campeones e insignias."""
+        hechas = {f[0] for f in q("SELECT DISTINCT semana FROM semanal_campeones").fetchall()}
+        for fila in q("SELECT DISTINCT semana FROM semanal WHERE semana < ?", (semana_actual,)).fetchall():
+            sem = fila[0]
+            if sem in hechas:
+                continue
+            top = q("SELECT cuenta, nombre, club, puntos FROM semanal WHERE semana = ? AND partidas >= ? "
+                    "ORDER BY puntos DESC, ultimo ASC LIMIT 3", (sem, ranking.MIN_PARTIDAS_VISIBLE)).fetchall()
+            for i, f in enumerate(top):
+                q("INSERT INTO semanal_campeones (semana, puesto, cuenta, nombre, club, puntos) VALUES (?, ?, ?, ?, ?, ?)",
+                  (sem, i + 1, f[0], f[1], f[2] or "", int(f[3])))
+            q("INSERT INTO semanal_campeones (semana, puesto, cuenta, nombre, club, puntos) VALUES (?, 0, '', '', '', 0)",
+              (sem,))   # marca: esta semana ya se archivó (aunque no haya tenido podio)
+
+    def semanal_ranking(self, cuenta=None, limite=10, ahora=None):
+        """Todo lo que muestra la pantalla: diario, semanal (top, mi puesto), misiones, campeones e insignias."""
+        cuenta = str(cuenta).upper() if cuenta else None
+        ahora = time.time() if ahora is None else ahora
+        semana = ranking.semana_clave(ahora)
+        anterior = ranking.semana_clave(ahora - ranking.SEMANA_SEG)
+        dia = "D:" + ranking.dia_clave(ahora)
+        minimo = ranking.MIN_PARTIDAS_VISIBLE
+
+        def top(q, clave, lim, min_partidas):
+            return q("SELECT cuenta, nombre, club, puntos FROM semanal WHERE semana = ? AND partidas >= ? "
+                     "ORDER BY puntos DESC, ultimo ASC LIMIT ?", (clave, min_partidas, int(lim))).fetchall()
+
+        def mio(q, clave, min_partidas):
+            if not cuenta:
+                return None
+            m = q("SELECT puntos, partidas, ultimo FROM semanal WHERE semana = ? AND cuenta = ?",
+                  (clave, cuenta)).fetchone()
+            if m is None:
+                return {"puntos": 0, "partidas": 0, "puesto": None}
+            puesto = None
+            if int(m[1]) >= min_partidas:
+                puesto = 1 + int(q("SELECT COUNT(*) FROM semanal WHERE semana = ? AND partidas >= ? AND "
+                                   "(puntos > ? OR (puntos = ? AND ultimo < ?))",
+                                   (clave, min_partidas, int(m[0]), int(m[0]), int(m[2]))).fetchone()[0])
+            return {"puntos": int(m[0]), "partidas": int(m[1]), "puesto": puesto}
+
+        def trabajo(q):
+            self._archivar_semanas(q, semana)
+            filas = top(q, semana, limite, minimo)
+            vigente = q("SELECT cuenta FROM semanal_campeones WHERE semana = ? AND puesto = 1", (anterior,)).fetchone()
+            vigente = vigente[0] if vigente else None
+            cuentas = [f[0] for f in filas] + ([cuenta] if cuenta else [])
+            titulos = {}
+            if cuentas:
+                for f in q("SELECT cuenta, COUNT(*) FROM semanal_campeones WHERE puesto = 1 AND cuenta IN (%s) "
+                           "GROUP BY cuenta" % ",".join("?" * len(cuentas)), tuple(cuentas)).fetchall():
+                    titulos[f[0]] = int(f[1])
+            lista = [{"puesto": i + 1, "nombre": f[1], "club": f[2], "puntos": int(f[3]), "yo": f[0] == cuenta,
+                      "titulos": titulos.get(f[0], 0), "vigente": f[0] == vigente} for i, f in enumerate(filas)]
+            yo = mio(q, semana, minimo)
+            misiones = []
+            if cuenta:
+                prog = {f[0]: (int(f[1]), int(f[2])) for f in q(
+                    "SELECT clave, progreso, cobrada FROM semanal_misiones WHERE semana = ? AND cuenta = ?",
+                    (semana, cuenta)).fetchall()}
+                for clave in ranking.MISIONES_ORDEN:
+                    meta, premio, titulo = ranking.MISIONES[clave]
+                    p, cobrada = prog.get(clave, (0, 0))
+                    misiones.append({"clave": clave, "titulo": titulo, "meta": meta, "premio": premio,
+                                     "progreso": p, "cumplida": bool(cobrada)})
+                podios = int(q("SELECT COUNT(*) FROM semanal_campeones WHERE cuenta = ? AND puesto >= 1",
+                               (cuenta,)).fetchone()[0])
+                yo["titulos"] = titulos.get(cuenta, 0)
+                yo["podios"] = podios
+                yo["vigente"] = cuenta == vigente
+            pasada = [{"puesto": i + 1, "nombre": f[1], "club": f[2], "puntos": int(f[3])}
+                      for i, f in enumerate(top(q, anterior, 3, minimo))]
+            diario = {"restan": ranking.segundos_restantes_dia(ahora),
+                      "top": [{"puesto": i + 1, "nombre": f[1], "club": f[2], "puntos": int(f[3]), "yo": f[0] == cuenta}
+                              for i, f in enumerate(top(q, dia, 3, ranking.MIN_PARTIDAS_DIARIO))],
+                      "yo": mio(q, dia, ranking.MIN_PARTIDAS_DIARIO)}
+            return {"semana": semana, "restan": ranking.segundos_restantes(ahora), "top": lista, "yo": yo,
+                    "anterior": pasada, "minimo": minimo, "misiones": misiones, "diario": diario}
         return self._transaccion(trabajo)
 
     def devolver_abiertas(self):

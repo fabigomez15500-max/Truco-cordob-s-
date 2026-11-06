@@ -8604,6 +8604,7 @@ class TrucoApp(App):
         sin_leer = int(getattr(self, "chats_sin_leer", 0) or 0)
         b_amigos = ItemMenuColor("grupo", "Amigos", ("Tenés %d mensaje%s sin leer." % (sin_leer, "" if sin_leer == 1 else "s"))
                                  if sin_leer else "Agregá amigos y mirá quién está en línea.", VIOLETA, 0.40, insignia=sin_leer)
+        b_rank = ItemMenuColor("copa", "Rankings y misiones", "Sumá puntos online, cumplí misiones y peleá por ser campeón.", DORADO, 0.43)
         b_perfil = ItemMenuColor("perfil", "Perfil", "Tus datos, tu club y tu cuenta.", TURQUESA, 0.47)
         b_academia = ItemMenuColor("libro", "Academia", "Reglas y trivia para aprender a jugar.", AZUL, 0.54)
         b_ind.bind(on_release=self.iniciar_individual)
@@ -8613,9 +8614,10 @@ class TrucoApp(App):
         b_online.bind(on_release=lambda *_: (setattr(self, "_online_mision_pendiente", False),
                                              self.cambiar_pantalla(self.build_online_menu())))
         b_amigos.bind(on_release=lambda *_: self.cambiar_pantalla(self.build_amigos()))
+        b_rank.bind(on_release=lambda *_: self.cambiar_pantalla(self.build_ranking_semanal()))
         b_perfil.bind(on_release=lambda *_: self.cambiar_pantalla(self.build_perfil()))
         b_academia.bind(on_release=lambda *_: self.cambiar_pantalla(self.build_academia()))
-        for b in (b_ind, b_torneo, b_lib, b_gira, b_online, b_amigos, b_perfil, b_academia):
+        for b in (b_ind, b_torneo, b_lib, b_gira, b_online, b_amigos, b_rank, b_perfil, b_academia):
             menu.add_widget(b)
         self.amigos_latido_iniciar()
         # Menú "Pruebas" deshabilitado por ahora. Para volver a verlo, sacá los # de estas 3 líneas.
@@ -9810,6 +9812,10 @@ class TrucoApp(App):
         t["resultado_enviado"] = True
         ganador = t.get("pid") if gane else t.get("rival_pid")
         self.tp_enviar({"action": "resultado", "match": t["jugando"], "winner": ganador})
+        if getattr(self, "modo_online", False) and not getattr(self, "online_resultado_enviado", False):
+            self.online_resultado_enviado = True
+            slot_ganador = int(self.online_slot) if gane else 1 - int(self.online_slot)
+            self.online_enviar_accion({"action": "result", "winner_slot": slot_ganador, "score": self.online_score()})
         self.estado.text = ("¡Ganaste el partido! Volvemos al cuadro…" if gane
                             else "Perdiste el partido. Volvemos al cuadro…")
         self.tp_programar_vuelta(4.0)
@@ -9884,19 +9890,254 @@ class TrucoApp(App):
         gane = fin.get("campeon_pid") == t.get("pid")
         res = fin.get("result", "")
         pozo = int(fin.get("pot") or 0)
+        rank = int(fin.get("rank") or 0)
         perfil = getattr(self, "perfil_usuario", None) or {}
         club = perfil.get("club") if perfil.get("club") in CLUBES_ARGENTINOS else None
         if gane:
             self.mostrar_animacion_campeon(
                 equipo=club, premio=pozo if res == "win" else 0, titulo="¡CAMPEÓN!", unidad="monedas",
-                lineas=[("Torneo privado", "18sp", (0.96, 0.82, 0.40, 1))], al_terminar=self.tp_salir)
+                lineas=[("Torneo privado", "18sp", (0.96, 0.82, 0.40, 1))]
+                + ([("+%d puntos del ranking semanal" % rank, "14sp", (0.85, 0.85, 0.85, 1))] if rank else [])
+                + [("Misión cumplida: %s" % m.get("titulo", ""), "13sp", (0.55, 0.80, 0.25, 1)) for m in fin.get("missions", [])],
+                al_terminar=self.tp_salir)
             return
         texto = "El campeón es %s." % fin.get("campeon", "")
         if res == "lose":
             texto += "\nPerdiste tu inscripción de %d monedas." % int(t.get("bet") or 0)
         elif res == "refund":
             texto += "\nSe te devolvió la inscripción."
+        if rank:
+            texto += "\n+%d puntos del ranking semanal." % rank
+        for m in fin.get("missions", []):
+            texto += "\nMisión cumplida: %s." % m.get("titulo", "")
         self.online_aviso(texto, "Torneo terminado", botones=[("VOLVER AL MENÚ", self.tp_salir)])
+
+    # ================= Ranking semanal (sin monedas: solo prestigio) =================
+    def online_score(self):
+        """Marcador de la partida online como [puntos del slot 0, puntos del slot 1]."""
+        mios, rival = int(self.puntos_jugador), int(self.puntos_ia)
+        return [mios, rival] if int(getattr(self, "online_slot", 0) or 0) == 0 else [rival, mios]
+
+    def rk_reportar_ia(self):
+        """Ganarle a la IA suma 1 punto semanal (el servidor pone el tope diario)."""
+        if not self.tiene_cuenta() or getattr(self, "_fin_por_prueba", False):
+            return
+        self.api("/semanal/ia", dict(self.amigos_credenciales(), evento=secrets.token_hex(6)),
+                 ok=lambda r: None, fallo=lambda *a, **k: None)
+
+    def build_ranking_semanal(self):
+        pantalla, c = self._pantalla_con_volver("RANKINGS", lambda: self.cambiar_pantalla(self.build_menu()))
+        DORADO = (0.96, 0.78, 0.15)
+        TINTA = (0.12, 0.08, 0.02, 1)
+
+        def barra(texto):
+            return FilaPanel(fondo=(0.96, 0.78, 0.15, 1), text="[b]%s[/b]" % texto, markup=True, font_size="16sp",
+                             color=TINTA, halign="center", size_hint_y=None, height=dp(36))
+
+        def etiqueta(alto, tam):
+            e = Label(markup=True, font_size=tam, halign="center", valign="middle", color=(0.96, 0.82, 0.40, 1),
+                      size_hint_y=None, height=dp(alto))
+            e.bind(size=lambda w, *_: setattr(w, "text_size", (w.width, w.height)))
+            return e
+        # --- diario ---
+        c.add_widget(barra("Ranking diario"))
+        self.rk_lbl_dia = etiqueta(26, "13sp")
+        c.add_widget(self.rk_lbl_dia)
+        self.rk_caja_dia = BoxLayout(orientation="vertical", spacing=dp(5), size_hint_y=None)
+        self.rk_caja_dia.bind(minimum_height=self.rk_caja_dia.setter("height"))
+        c.add_widget(self.rk_caja_dia)
+        # --- semanal ---
+        c.add_widget(barra("Ranking semanal"))
+        self.rk_lbl_tiempo = etiqueta(66, "14sp")
+        self.rk_lbl_tiempo.text = "Cargando el ranking…"
+        c.add_widget(self.rk_lbl_tiempo)
+        self.rk_lbl_mis = etiqueta(40, "16sp")
+        self.rk_lbl_mis.color = (1, 1, 1, 1)
+        c.add_widget(self.rk_lbl_mis)
+        self.rk_caja = BoxLayout(orientation="vertical", spacing=dp(5), size_hint_y=None)
+        self.rk_caja.bind(minimum_height=self.rk_caja.setter("height"))
+        c.add_widget(self.rk_caja)
+        # --- misiones ---
+        self.rk_caja_mis = BoxLayout(orientation="vertical", spacing=dp(5), size_hint_y=None)
+        self.rk_caja_mis.bind(minimum_height=self.rk_caja_mis.setter("height"))
+        c.add_widget(self.rk_caja_mis)
+        reglas = boton_cartel("¿CÓMO SE SUMAN LOS PUNTOS?", DORADO, "14sp", 50)
+        reglas.bind(on_release=lambda *_: self.rk_reglas())
+        c.add_widget(reglas)
+        c.add_widget(Adorno())
+        self.rk_datos = None
+        self.rk_cargar()
+        token = object()
+        self._rk_tick_token = token
+
+        def tick(_dt):
+            if self._rk_tick_token is not token or pantalla.parent is None:
+                return False
+            self.rk_pintar_tiempo()
+        Clock.schedule_interval(tick, 1)
+        return pantalla
+
+    def rk_cargar(self):
+        def ok(datos):
+            self.rk_datos = datos
+            self.rk_t0 = time.time()
+            self.rk_pintar(datos)
+
+        def fallo(mensaje="", codigo=None):
+            if getattr(self, "rk_lbl_tiempo", None) is not None and self.rk_lbl_tiempo.parent is not None:
+                self.rk_lbl_tiempo.text = "No se pudo cargar el ranking.\nRevisá tu internet."
+        self.api("/semanal/ranking", self.amigos_credenciales() if self.tiene_cuenta() else {}, ok=ok, fallo=fallo)
+
+    @staticmethod
+    def _rk_reloj(seg, con_dias):
+        seg = max(0, int(seg))
+        dias, r = divmod(seg, 86400)
+        horas, r = divmod(r, 3600)
+        minutos, s = divmod(r, 60)
+        if con_dias:
+            return "%02d : %02d : %02d : %02d" % (dias, horas, minutos, s)
+        return "%02d : %02d : %02d" % (horas + dias * 24, minutos, s)
+
+    def rk_pintar_tiempo(self):
+        d = getattr(self, "rk_datos", None)
+        if not d or self.rk_lbl_tiempo.parent is None:
+            return
+        pasado = int(time.time() - getattr(self, "rk_t0", time.time()))
+        self.rk_lbl_tiempo.text = "[size=12sp]La semana termina en[/size]\n[b][size=26sp]%s[/size][/b]" % self._rk_reloj(
+            int(d.get("restan", 0)) - pasado, True)
+        dia = d.get("diario") or {}
+        self.rk_lbl_dia.text = "El día termina en [b]%s[/b]" % self._rk_reloj(int(dia.get("restan", 0)) - pasado, False)
+
+    def _rk_fila(self, f, puntos_tam="22sp"):
+        medallas = {1: (0.96, 0.78, 0.15), 2: (0.78, 0.80, 0.84), 3: (0.80, 0.50, 0.25)}
+        puntos = Label(text="[b]%d[/b]" % f["puntos"], markup=True, font_size=puntos_tam, halign="right", valign="middle",
+                       size_hint_x=None, width=dp(86), color=(1, 1, 1, 1))
+        puntos.bind(size=lambda w, *_: setattr(w, "text_size", (w.width, w.height)))
+        col = medallas.get(f["puesto"])
+        marca = ("[color=%02x%02x%02x][b]%d°[/b][/color]" % (int(col[0] * 255), int(col[1] * 255), int(col[2] * 255), f["puesto"])
+                 if col else "[b]%d°[/b]" % f["puesto"])
+        insignia = ""
+        if f.get("vigente"):
+            insignia = "\n[size=11sp][color=f5c518][b]CAMPEÓN SEMANAL[/b][/color][/size]"
+        elif f.get("titulos"):
+            insignia = "\n[size=11sp][color=f5c518]%d semana%s de campeón[/color][/size]" % (
+                f["titulos"], "" if f["titulos"] == 1 else "s")
+        yo = f.get("yo")
+        return FilaClub([f.get("club") or ""], ["%s  %s%s%s" % (marca, self._tp_esc(f["nombre"]),
+                                                              "  (vos)" if yo else "", insignia)],
+                        fondo=(0.45, 0.33, 0.10, 0.40) if yo else (0, 0, 0, 0.30),
+                        borde=(0.96, 0.78, 0.15, 1) if yo else None, alto=58 if insignia else 54, tam="16sp",
+                        extra=[puntos])
+
+    def rk_pintar(self, d):
+        caja = getattr(self, "rk_caja", None)
+        if caja is None or caja.parent is None:
+            return
+        self.rk_pintar_tiempo()
+        # --- diario ---
+        dia = d.get("diario") or {}
+        self.rk_caja_dia.clear_widgets()
+        for f in dia.get("top", []):
+            self.rk_caja_dia.add_widget(self._rk_fila(f, "20sp"))
+        if not dia.get("top"):
+            self.rk_caja_dia.add_widget(Label(text="Hoy todavía no jugó nadie contra personas.", font_size="13sp",
+                                              color=(0.85, 0.85, 0.85, 1), size_hint_y=None, height=dp(30)))
+        ydia = dia.get("yo")
+        if ydia:
+            self.rk_caja_dia.add_widget(Label(
+                text="[color=f5c518]Mis puntos de hoy:[/color] [b]%d[/b]" % ydia.get("puntos", 0), markup=True,
+                font_size="14sp", size_hint_y=None, height=dp(30)))
+        # --- semanal ---
+        yo = d.get("yo")
+        if yo:
+            puesto = ("   ·   Puesto: [b]%d°[/b]" % yo["puesto"]) if yo.get("puesto") else ""
+            self.rk_lbl_mis.text = "[color=f5c518]Mis puntos:[/color] [b]%d[/b]%s" % (yo.get("puntos", 0), puesto)
+        else:
+            self.rk_lbl_mis.text = "Creá tu cuenta para sumar puntos."
+        caja.clear_widgets()
+        for f in d.get("top", []):
+            caja.add_widget(self._rk_fila(f))
+        if not d.get("top"):
+            caja.add_widget(Label(text="Todavía no hay nadie en la tabla.\nJugá %d partidas online contra personas para aparecer." % d.get("minimo", 5),
+                                  halign="center", font_size="14sp", color=(0.85, 0.85, 0.85, 1), size_hint_y=None, height=dp(60)))
+        elif yo and not yo.get("puesto"):
+            caja.add_widget(Label(text="Te faltan %d partidas contra personas para aparecer en la tabla." % max(0, d.get("minimo", 5) - yo.get("partidas", 0)),
+                                  halign="center", font_size="13sp", color=(0.85, 0.85, 0.85, 1), size_hint_y=None, height=dp(36)))
+        if d.get("anterior"):
+            caja.add_widget(Label(text="CAMPEONES DE LA SEMANA PASADA", bold=True, font_size="13sp", color=(0.93, 0.74, 0.22, 1),
+                                  size_hint_y=None, height=dp(34)))
+            for f in d["anterior"]:
+                caja.add_widget(FilaPanel(text="[b]%d°[/b]  %s   [color=a89f8c]%d puntos[/color]" % (
+                    f["puesto"], self._tp_esc(f["nombre"]), f["puntos"]), markup=True, font_size="13sp",
+                    size_hint_y=None, height=dp(34)))
+        # --- misiones ---
+        self.rk_caja_mis.clear_widgets()
+        if d.get("misiones"):
+            self.rk_caja_mis.add_widget(FilaPanel(fondo=(0.96, 0.78, 0.15, 1), text="[b]Misiones de la semana[/b]", markup=True,
+                                                  font_size="16sp", color=(0.12, 0.08, 0.02, 1), halign="center",
+                                                  size_hint_y=None, height=dp(36)))
+            for m in d["misiones"]:
+                if m.get("cumplida"):
+                    sub = "[color=8cd34a][b]Cumplida[/b]  ·  +%d puntos[/color]" % m["premio"]
+                else:
+                    sub = "[color=a89f8c]%d / %d   ·   +%d puntos[/color]" % (m["progreso"], m["meta"], m["premio"])
+                self.rk_caja_mis.add_widget(FilaPanel(
+                    text="[b]%s[/b]\n%s" % (self._tp_esc(m["titulo"]), sub), markup=True, font_size="13sp",
+                    fondo=(0.20, 0.40, 0.12, 0.35) if m.get("cumplida") else (0, 0, 0, 0.30),
+                    size_hint_y=None, height=dp(56)))
+
+    def rk_cargar_insignia(self):
+        """En el perfil: si fuiste campeón semanal, se muestra tu insignia."""
+        if not self.tiene_cuenta():
+            return
+
+        def ok(d):
+            lbl = getattr(self, "perfil_insignia", None)
+            yo = d.get("yo") or {}
+            if lbl is None or lbl.parent is None or not yo.get("titulos"):
+                return
+            n = yo["titulos"]
+            lbl.text = "[b]%s[/b]\n[size=12sp]%d semana%s como campeón del ranking[/size]" % (
+                "CAMPEÓN SEMANAL" if yo.get("vigente") else "EX CAMPEÓN SEMANAL", n, "" if n == 1 else "s")
+            lbl.height = dp(52)
+            lbl.opacity = 1
+        self.api("/semanal/ranking", self.amigos_credenciales(), ok=ok, fallo=lambda *a, **k: None)
+
+    def rk_reglas(self):
+        panel = self._cartel_online("¿Cómo se suman?")
+        texto = ("[b]Partidas contra personas[/b]\n"
+                 "Ganar: +10 (y +1 cada 3 puntos de diferencia, hasta +5)\n"
+                 "Perder: +2\n"
+                 "3 victorias seguidas: +5\n"
+                 "Ganarle a alguien que va arriba tuyo: +3\n"
+                 "Ganar apostando: +1 cada 50 monedas (hasta +6)\n\n"
+                 "[b]Contra la IA[/b]\n"
+                 "Ganar: +1 (hasta 5 por día)\n\n"
+                 "[b]Torneo privado (3 o más personas)[/b]\n"
+                 "Campeón +30, finalista +15, semifinalista +8\n\n"
+                 "[b]Misiones de la semana[/b]\n"
+                 "Cada misión cumplida suma puntos extra (de +10 a +15). Se renuevan el lunes.\n\n"
+                 "[b]Ranking diario[/b]\n"
+                 "Es la suma de los puntos de hoy y se reinicia a la medianoche.\n\n"
+                 "[b]Campeón semanal[/b]\n"
+                 "Quien termina primero la semana se lleva la insignia, que se ve en el ranking y en su perfil.\n\n"
+                 "[b]Importante[/b]\n"
+                 "Contra el mismo rival cuentan 3 partidas por semana.\n"
+                 "Para aparecer en la tabla semanal hacen falta 5 partidas contra personas.\n"
+                 "La semana cierra el lunes a las 00:00 y el ranking arranca de cero.\n"
+                 "No da monedas: es solo para la gloria.")
+        et = Label(text=texto, markup=True, font_size="14sp", halign="left", valign="top", size_hint_y=None,
+                   color=(0.93, 0.90, 0.85, 1))
+        et.bind(width=lambda w, *_: setattr(w, "text_size", (w.width, None)))
+        et.bind(texture_size=lambda w, ts: setattr(w, "height", ts[1] + dp(10)))
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(4))
+        scroll.add_widget(et)
+        panel.add_widget(scroll)
+        cerrar = boton_cartel("ENTENDIDO", (0.96, 0.78, 0.15), "15sp", 52)
+        panel.add_widget(cerrar)
+        popup = self._popup_cartel(panel, alto_rel=0.86, auto_dismiss=True)
+        cerrar.bind(on_release=popup.dismiss)
+        popup.open()
 
     def build_perfil(self):
         pantalla, c = self._pantalla_con_volver("Perfil", lambda: self.cambiar_pantalla(self.build_menu()))
@@ -9906,6 +10147,10 @@ class TrucoApp(App):
         VERDE, DORADO, CELESTE = (0.55, 0.80, 0.25, 1), (0.96, 0.78, 0.15, 1), (0.45, 0.72, 0.95, 1)
         tarjeta = TarjetaPerfil(club, nombre)
         c.add_widget(tarjeta)
+        self.perfil_insignia = Label(markup=True, font_size="15sp", halign="center", color=(0.96, 0.78, 0.15, 1),
+                                     size_hint_y=None, height=0, opacity=0)
+        c.add_widget(self.perfil_insignia)
+        self.rk_cargar_insignia()
         datos_g = self.gira_datos()
         hechos = sum(1 for lg in GIRA_LOGROS if ("logro." + lg["id"]) in (datos_g.get("hechas") or {}))
         chips = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(70), spacing=dp(8))
@@ -14665,8 +14910,8 @@ class TrucoApp(App):
         self.api("/room/" + urllib.parse.quote(codigo, safe=""), None, metodo="GET", ok=ok, fallo=fallo)
 
     def online_enviar_accion(self, accion):
-        if accion.get("action") == "result":
-            # Se reenvía tras reconectar hasta que llegue bet_result / bet_error.
+        if accion.get("action") == "result" and int(getattr(self, "online_bet", 0) or 0) > 0:
+            # Con apuesta: se reenvía tras reconectar hasta que llegue bet_result / bet_error.
             self.online_result_pendiente = accion
         ws = getattr(self, "online_ws", None)
         if ws is None:
@@ -15253,6 +15498,12 @@ class TrucoApp(App):
                 return
             if self.online_iniciar_reconexion():
                 return
+        if tipo == "rank_points":
+            extra = "".join("\nMisión cumplida: %s (+%d)" % (m.get("titulo", ""), int(m.get("premio", 0)))
+                            for m in msg.get("missions", []))
+            try: self.estado.text = "%s\n+%d puntos del ranking semanal%s" % (self.estado.text, int(msg.get("points", 0)), extra)
+            except Exception: pass
+            return
         if (tipo == "opponent_left" and getattr(self, "modo_online", False)
                 and getattr(self, "modo_torneo_priv", False)):
             self.tp_rival_se_fue()
@@ -16004,6 +16255,7 @@ class TrucoApp(App):
         self.mostrar_panel_torneo()
 
     def build_partida(self):
+        self._fin_por_prueba = False
         self.title = "Truco Argentino"
         self.reloj_turno_detener()
         self.puntos_jugador = 0
@@ -17316,13 +17568,14 @@ class TrucoApp(App):
                     novedades = list(novedades) + self.desafio_resolver(self.desafio_activo, self.puntos_jugador >= PUNTOS_PARTIDA)
                 except Exception as error:
                     print("Error en el desafío:", error)
+            if self.puntos_jugador >= PUNTOS_PARTIDA and not getattr(self, "modo_online", False):
+                self.rk_reportar_ia()
             self.cartel_fin_partida(self.puntos_jugador >= PUNTOS_PARTIDA, novedades)
-        if (getattr(self, "modo_online", False) and int(getattr(self, "online_bet", 0)) > 0
-                and not getattr(self, "online_resultado_enviado", False)):
-            # Los dos celulares informan quién ganó; el servidor liquida la apuesta.
+        if getattr(self, "modo_online", False) and not getattr(self, "online_resultado_enviado", False):
+            # Los dos celulares informan quién ganó y cómo quedó: el servidor liquida la apuesta y suma al ranking.
             self.online_resultado_enviado = True
             ganador = self.online_slot if self.puntos_jugador >= PUNTOS_PARTIDA else 1 - int(self.online_slot)
-            self.online_enviar_accion({"action": "result", "winner_slot": int(ganador)})
+            self.online_enviar_accion({"action": "result", "winner_slot": int(ganador), "score": self.online_score()})
         if (not getattr(self, "modo_online", False) and not getattr(self, "modo_torneo", False)
                 and getattr(self, "apuesta_ticket", None)):
             self.reclamar_apuesta("ganar" if self.puntos_jugador >= PUNTOS_PARTIDA else "perder")
@@ -17891,6 +18144,7 @@ class TrucoApp(App):
         self.ia_canto = None
         self.actualizar_marcador()
         self.actualizar_botones()
+        self._fin_por_prueba = True   # el botón de prueba no suma al ranking
         self.avisar_fin_partida("Partida ganada (prueba).")
 
     def pedir_salir_partida(self, *_):

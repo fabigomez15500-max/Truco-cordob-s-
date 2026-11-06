@@ -63,11 +63,17 @@ DIA_PUNTOS_BASE = 150
 DIA_PUNTOS_RACHA = 25
 DIA_RACHA_TOPE = 6
 DIA_LOGRO_ID = "truco_del_dia"
-# Ruleta: el celular informa el casillero como logro «ruleta_<puntos>»; el premio lo fija este diccionario, no el celular.
-# Tope de giros cobrados por día (fecha de Argentina): el celular da 1 por día, pero con 2 no se pierde un giro hecho sin
-# conexión justo antes de medianoche y enviado después de que el servidor ya cambió de día.
-RULETA_LOGRO_PUNTOS = {"ruleta_25": 25, "ruleta_50": 50, "ruleta_100": 100}
-RULETA_MAX_DIA = 2
+# Desafíos diarios y semanales (Ruleta, personaje del día, metas semanales): el celular informa el id del premio y el servidor
+# fija los puntos, así que el celular no puede pedir más. Cada id tiene (puntos, período, grupo, tope): el tope es cuántos cobros del
+# grupo se aceptan por período (fecha de Argentina; semana de lunes a domingo). Diarios: 2, así no se pierde un premio ganado sin
+# conexión justo antes de medianoche y enviado después; semanales: 1.
+LOGROS_PERIODICOS = {
+    "ruleta_25": (25, "dia", "ruleta", 2), "ruleta_50": (50, "dia", "ruleta", 2), "ruleta_100": (100, "dia", "ruleta", 2),
+    "personaje_50": (50, "dia", "personaje", 2), "personaje_75": (75, "dia", "personaje", 2),
+    "personaje_100": (100, "dia", "personaje", 2),
+    "semanal_ruleta": (150, "semana", "semanal_ruleta", 1), "semanal_truco": (200, "semana", "semanal_truco", 1),
+    "semanal_personajes": (250, "semana", "semanal_personajes", 1), "semanal_completa": (200, "semana", "semanal_completa", 1),
+}
 # Poderes de la Gira: el servidor fija el precio (el celular no puede pagar menos). Mismo orden que PODERES del cliente:
 # la oferta del día se elige por la fecha de Argentina y tiene que dar el mismo resultado en el celular y acá.
 PODERES_PRECIO = [("mago", 150), ("cientifico", 100), ("detective", 50), ("fenix", 150), ("soplon", 50),
@@ -379,6 +385,42 @@ class Banco:
             return pagos
         return self._transaccion(trabajo)
 
+    def devolver_cuenta(self, sala, cuenta_id):
+        """Devuelve lo que una cuenta tenía retenido en la sala (p. ej. al irse de un torneo antes de empezar).
+
+        Devuelve el monto devuelto (0 si no había nada abierto).
+        """
+        cuenta_id = str(cuenta_id).upper()
+
+        def trabajo(q):
+            filas = q("SELECT id, monto FROM retenciones WHERE sala = ? AND cuenta = ? AND abierta = 1",
+                      (sala, cuenta_id)).fetchall()
+            if not filas:
+                return 0
+            total = sum(int(f[1]) for f in filas)
+            now = int(time.time())
+            q("UPDATE cuentas SET monedas = monedas + ? WHERE id = ?", (total, cuenta_id))
+            q("INSERT INTO movimientos (cuenta, delta, motivo, ref, fecha) VALUES (?, ?, 'devolucion', ?, ?)",
+              (cuenta_id, total, sala, now))
+            for f in filas:
+                q("UPDATE retenciones SET abierta = 0 WHERE id = ?", (f[0],))
+            return total
+        return self._transaccion(trabajo)
+
+    def perder_retenciones(self, sala):
+        """Cierra las retenciones abiertas de la sala SIN pagarle a nadie (las apuestas se pierden).
+
+        Devuelve {cuenta: monto_perdido} (vacío si no había nada abierto).
+        """
+        def trabajo(q):
+            filas = q("SELECT id, cuenta, monto FROM retenciones WHERE sala = ? AND abierta = 1", (sala,)).fetchall()
+            perdidas = {}
+            for f in filas:
+                perdidas[f[1]] = perdidas.get(f[1], 0) + int(f[2])
+                q("UPDATE retenciones SET abierta = 0 WHERE id = ?", (f[0],))
+            return perdidas
+        return self._transaccion(trabajo)
+
     def devolver_abiertas(self):
         """Al arrancar: devuelve toda apuesta que quedó abierta por un reinicio."""
         def trabajo(q):
@@ -636,38 +678,44 @@ class Banco:
             return {"ok": True, "premio": premio, "racha": racha, "fecha": hoy}
         return self._transaccion(trabajo)
 
-    def gira_ruleta(self, cuenta_id, evento_id, logro_id, nombre="", club=""):
-        """Suma los puntos que dio un giro de la Ruleta. El premio sale de RULETA_LOGRO_PUNTOS (el celular no elige cuántos),
-        cada evento se cobra una sola vez y hay un máximo de giros cobrados por día."""
+    def gira_periodico(self, cuenta_id, evento_id, logro_id, nombre="", club=""):
+        """Suma los puntos de un premio diario o semanal (Ruleta, personaje del día, desafío semanal). Los puntos salen de
+        LOGROS_PERIODICOS (el celular no elige cuántos), cada evento se cobra una sola vez y hay un tope de cobros por período."""
+        import datetime as _dt
         cuenta_id = str(cuenta_id).upper()
         evento_id = str(evento_id)[:64]
-        logro_id = str(logro_id)[:40]
-        premio = RULETA_LOGRO_PUNTOS.get(logro_id)
-        if premio is None or not evento_id:
-            return {"error": "Premio de ruleta inválido."}
+        info = LOGROS_PERIODICOS.get(str(logro_id)[:40])
+        if info is None or not evento_id:
+            return {"error": "Premio inválido."}
+        premio, periodo, grupo, tope = info
         hoy = self._fecha_argentina(0)
+        if periodo == "semana":
+            anio, semana, _d = _dt.date.fromisoformat(hoy).isocalendar()
+            periodo_clave = f"{anio}-W{semana:02d}"
+        else:
+            periodo_clave = hoy
 
         def trabajo(q):
             if q("SELECT 1 FROM gira_eventos WHERE id = ?", (evento_id,)).fetchone():
                 return {"repetido": True}
             casilla = None
-            for n in range(1, RULETA_MAX_DIA + 1):
-                clave = f"ruleta:{cuenta_id}:{hoy}:{n}"
+            for n in range(1, tope + 1):
+                clave = f"per:{grupo}:{cuenta_id}:{periodo_clave}:{n}"
                 if not q("SELECT 1 FROM gira_eventos WHERE id = ?", (clave,)).fetchone():
                     casilla = clave
                     break
             if casilla is None:
-                return {"repetido": True}   # ya se cobró el máximo de hoy: se da por informado para que el celular no reintente
+                return {"repetido": True}   # ya se cobró el máximo del período: se da por informado para que el celular no reintente
             now = int(time.time())
             fila = q("SELECT nombre, club, puntos, torneos, regiones, ultimo FROM gira WHERE cuenta = ?",
                      (cuenta_id,)).fetchone()
             nom, clb, puntos, torneos, regs, ultimo = (fila if fila else ("", "", 0, 0, "", 0))
-            # "ultimo" no se toca: la ruleta no cuenta para el tiempo mínimo entre victorias
+            # "ultimo" no se toca: estos premios no cuentan para el tiempo mínimo entre victorias
             self._gira_guardar(q, cuenta_id, nombre or nom or "Jugador", club or clb, int(puntos) + premio,
                                int(torneos), self._gira_leer(regs), int(ultimo))
             q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (evento_id, cuenta_id, now))
             q("INSERT INTO gira_eventos (id, cuenta, fecha) VALUES (?, ?, ?)", (casilla, cuenta_id, now))
-            return {"ok": True, "premio": premio, "fecha": hoy}
+            return {"ok": True, "premio": premio, "periodo": periodo_clave}
         return self._transaccion(trabajo)
 
     def gira_descuento(self, cuenta_id, evento_id, puntos, motivo="desafio", nombre="", club=""):

@@ -15,6 +15,7 @@ import contextlib
 import hmac
 import json
 import os
+import random
 import secrets
 import time
 
@@ -23,14 +24,18 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from economia import Banco, DIA_LOGRO_ID, RULETA_LOGRO_PUNTOS, poderes_ofertas
+from economia import Banco, DIA_LOGRO_ID, LOGROS_PERIODICOS, poderes_ofertas
 from social import Social
+from torneos import NOMBRES_BOT, TAM_MAX, TAM_MIN, Torneo, nombre_ronda
 
 banco = Banco()
 
 
 def _sala_espera(codigo):
     """True mientras la sala existe, no empezó y espera a un segundo jugador."""
+    tor = torneos.get(codigo)
+    if tor is not None:
+        return tor["t"].estado == "lobby" and bool(tor["t"].jugadores)
     room = rooms.get(codigo)
     return room is not None and not room["started"] and len(room["players"]) == 1
 
@@ -41,8 +46,12 @@ APUESTA_MIN = int(os.environ.get("APUESTA_MIN", "10"))
 APUESTA_MAX = int(os.environ.get("APUESTA_MAX", "100000"))
 ESPERA_REPORTE = float(os.environ.get("ESPERA_REPORTE", "20"))  # segundos
 ESPERA_TICKET = int(os.environ.get("ESPERA_TICKET", "60"))  # mínimo entre resultados contra la IA
+MAX_TORNEOS = int(os.environ.get("MAX_TORNEOS", "200"))
+ESPERA_SALA_TORNEO = float(os.environ.get("ESPERA_SALA_TORNEO", "75"))   # s para que los dos entren a su partido
+MIN_PARTIDO_IA = float(os.environ.get("MIN_PARTIDO_IA", "15"))   # una partida contra un bot no puede terminar antes
 
 rooms = {}
+torneos = {}   # código -> torneo privado (en memoria; si el servidor se reinicia, las apuestas se devuelven)
 waiting = []
 rooms_lock = asyncio.Lock()
 registros_por_ip = {}
@@ -56,7 +65,7 @@ def code_room():
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     while True:
         code = "".join(secrets.choice(alphabet) for _ in range(5))
-        if code not in rooms:
+        if code not in rooms and code not in torneos:
             return code
 
 
@@ -260,9 +269,392 @@ async def cerrar_jugador(room_code, room, slot, ws):
         rooms.pop(room_code, None)
 
 
+# ----------------------------------------------------------- torneos privados
+# Un torneo es un cuadro de eliminación directa de 4 a 16 jugadores. Los lugares vacíos los
+# completan bots. Cada humano mantiene un WebSocket propio con el torneo (/ws_torneo); cada
+# partido entre humanos se juega en una sala común de 2 (la misma de siempre, sin apuesta propia)
+# y la apuesta de inscripción queda retenida en "TOR-<código>" hasta que hay campeón.
+def tor_sala(t):
+    return "TOR-" + t.codigo
+
+
+def nombre_unico(t, nombre):
+    usados = {j["nombre"].lower() for j in t.jugadores} | {b.lower() for b in NOMBRES_BOT}
+    nuevo, n = nombre, 2
+    while nuevo.lower() in usados:
+        nuevo = "%s %d" % (nombre[:28], n)
+        n += 1
+    return nuevo
+
+
+def tor_tarea(tor, corrutina):
+    tarea = asyncio.create_task(corrutina)
+    tor["tareas"].add(tarea)
+    tarea.add_done_callback(tor["tareas"].discard)
+    return tarea
+
+
+async def tor_enviar_a(tor, pid, payload):
+    ws = tor["ws"].get(pid)
+    if ws is not None:
+        await send(ws, payload)
+
+
+async def tor_difundir(tor, payload):
+    for ws in list(tor["ws"].values()):
+        await send(ws, payload)
+
+
+def tor_payload_lobby(tor):
+    t = tor["t"]
+    return {"type": "torneo_lobby", "room": t.codigo, "size": t.tam, "bet": t.apuesta, "powers": t.poderes,
+            "host": tor["host"], "players": [{"pid": j["pid"], "name": j["nombre"]} for j in t.jugadores]}
+
+
+def tor_payload_cuadro(tor, tipo="torneo_cuadro"):
+    t = tor["t"]
+    return {"type": tipo, "room": t.codigo, "cuadro": t.cuadro_publico(), "ronda": t.ronda_actual(),
+            "campeon": t.campeon, "estado": t.estado,
+            "jugadores": [{"pid": j["pid"], "name": j["nombre"], "humano": j["humano"]} for j in t.jugadores]}
+
+
+def tor_limpiar_sala(tor, partido_id):
+    codigo = tor["salas"].pop(partido_id, None)
+    room = rooms.get(codigo) if codigo else None
+    if room is not None and not room["players"]:
+        rooms.pop(codigo, None)
+
+
+async def torneo_empezar(tor):
+    t = tor["t"]
+    async with tor["lock"]:
+        if t.estado != "lobby" or not t.jugadores:
+            return
+        t.empezar()
+    await tor_difundir(tor, tor_payload_cuadro(tor, "torneo_inicio"))
+    await torneo_avanzar(tor)
+
+
+async def torneo_avanzar(tor):
+    """Lanza los partidos que ya tienen a sus dos jugadores (siempre de a una ronda)."""
+    t = tor["t"]
+    if t.estado != "en_juego":
+        return
+    listos = t.partidos_listos()
+    for p in listos:          # se marcan todos antes de cualquier await: nadie los lanza dos veces
+        p["estado"] = "jugando"
+    for p in listos:
+        if t.estado == "en_juego":
+            await torneo_lanzar(tor, p)
+
+
+async def torneo_lanzar(tor, p):
+    t = tor["t"]
+    ja, jb = t.jugador(p["a"]), t.jugador(p["b"])
+    r = int(p["id"][1:p["id"].index("m")])
+    ronda = nombre_ronda(r, len(t.rondas))
+    ausentes = [j for j in (ja, jb) if j["humano"] and j["pid"] not in tor["ws"]]
+    if ausentes:   # quien no está conectado pierde por ausencia
+        if len(ausentes) == 2:
+            ganador = random.choice([p["a"], p["b"]])
+        else:
+            ganador = jb["pid"] if ausentes[0] is ja else ja["pid"]
+        await torneo_cerrar(tor, p["id"], ganador)
+        return
+    humanos = [j for j in (ja, jb) if j["humano"]]
+    tor["inicio"][p["id"]] = time.time()
+    tor["reportes"].pop(p["id"], None)
+    tor["esperas"].discard(p["id"])
+    base = {"type": "torneo_partido", "match": p["id"], "ronda": ronda, "powers": t.poderes}
+    if not humanos:
+        tor_tarea(tor, torneo_simular(tor, p["id"]))
+    elif len(humanos) == 1:
+        h = humanos[0]
+        rival = jb if h is ja else ja
+        await tor_enviar_a(tor, h["pid"], dict(base, modo="ia", rival=rival["nombre"], rival_pid=rival["pid"]))
+    else:
+        tor_limpiar_sala(tor, p["id"])
+        codigo = code_room()
+        rooms[codigo] = nueva_sala(0)
+        tor["salas"][p["id"]] = codigo
+        for j, otro in ((ja, jb), (jb, ja)):
+            await tor_enviar_a(tor, j["pid"], dict(base, modo="sala", room=codigo, rival=otro["nombre"],
+                                                   rival_pid=otro["pid"]))
+        tor_tarea(tor, torneo_vigilar_sala(tor, p["id"], codigo))
+
+
+async def torneo_simular(tor, partido_id):
+    await asyncio.sleep(random.uniform(3, 7))
+    p = tor["t"].partido(partido_id)
+    if p is not None and p["estado"] != "fin":
+        await torneo_cerrar(tor, partido_id, random.choice([p["a"], p["b"]]))
+
+
+async def torneo_vigilar_sala(tor, partido_id, codigo):
+    """Si pasado un rato alguno no entró a la sala del partido, pierde por ausencia."""
+    await asyncio.sleep(ESPERA_SALA_TORNEO)
+    t = tor["t"]
+    p = t.partido(partido_id)
+    if p is None or p["estado"] != "jugando" or tor["salas"].get(partido_id) != codigo:
+        return
+    room = rooms.get(codigo)
+    if room is not None and room["started"]:
+        return
+    presentes = {pl["name"] for pl in room["players"]} if room is not None else set()
+    a_ok, b_ok = t.nombre_de(p["a"]) in presentes, t.nombre_de(p["b"]) in presentes
+    if a_ok and not b_ok:
+        ganador = p["a"]
+    elif b_ok and not a_ok:
+        ganador = p["b"]
+    else:
+        ganador = random.choice([p["a"], p["b"]])
+    await torneo_cerrar(tor, partido_id, ganador)
+
+
+async def torneo_cerrar(tor, partido_id, ganador):
+    t = tor["t"]
+    p = t.registrar(partido_id, ganador)
+    if p is None:
+        return
+    tor["reportes"].pop(partido_id, None)
+    tor["esperas"].discard(partido_id)
+    tor_limpiar_sala(tor, partido_id)
+    await tor_difundir(tor, dict(tor_payload_cuadro(tor), match=partido_id, winner=ganador))
+    if t.estado == "terminado":
+        await torneo_terminar(tor)
+    else:
+        await torneo_avanzar(tor)
+
+
+async def torneo_resultado(tor, pid, partido_id, ganador):
+    t = tor["t"]
+    p = t.partido(partido_id)
+    if p is None or p["estado"] != "jugando" or pid not in (p["a"], p["b"]) or ganador not in (p["a"], p["b"]):
+        return
+    humanos = [x for x in (p["a"], p["b"]) if t.jugador(x)["humano"]]
+    reportes = tor["reportes"].setdefault(partido_id, {})
+    reportes[pid] = ganador
+    if len(humanos) == 1:   # contra un bot: se confía en el celular, pero no puede terminar al instante
+        falta = MIN_PARTIDO_IA - (time.time() - tor["inicio"].get(partido_id, 0))
+        if falta > 0:
+            await asyncio.sleep(falta)
+        await torneo_cerrar(tor, partido_id, ganador)
+    elif len(reportes) >= 2:
+        if len(set(reportes.values())) == 1:
+            await torneo_cerrar(tor, partido_id, ganador)
+        elif tor["repetidos"].get(partido_id, 0) < 1:   # no coinciden: se juega de nuevo, una vez
+            tor["repetidos"][partido_id] = tor["repetidos"].get(partido_id, 0) + 1
+            await tor_difundir(tor, {"type": "torneo_aviso", "message": "Los celulares no coincidieron en el resultado. Se vuelve a jugar el partido."})
+            await torneo_lanzar(tor, p)
+        else:
+            await torneo_cerrar(tor, partido_id, random.choice([p["a"], p["b"]]))
+    elif partido_id not in tor["esperas"]:
+        tor["esperas"].add(partido_id)
+        tor_tarea(tor, torneo_esperar_reporte(tor, partido_id))
+
+
+async def torneo_esperar_reporte(tor, partido_id):
+    await asyncio.sleep(ESPERA_REPORTE)
+    p = tor["t"].partido(partido_id)
+    reportes = tor["reportes"].get(partido_id)
+    if p is not None and p["estado"] == "jugando" and reportes:
+        await torneo_cerrar(tor, partido_id, next(iter(reportes.values())))
+
+
+async def torneo_terminar(tor):
+    """Hay campeón: si es humano se lleva todo el pozo; si ganó un bot, el pozo se pierde (no se devuelve nada)."""
+    t = tor["t"]
+    campeon = t.jugador(t.campeon)
+    pagos = {}
+    if t.apuesta > 0:
+        if campeon["humano"]:
+            pagos = await db(banco.liquidar, tor_sala(t), campeon["cuenta"])
+        else:
+            pagos = await db(banco.perder_retenciones, tor_sala(t))
+    pozo = sum(pagos.values())
+    for pid, ws in list(tor["ws"].items()):
+        j = t.jugador(pid)
+        if not pagos:
+            res = ""
+        elif campeon["humano"] and campeon["cuenta"] in pagos:
+            res = "win" if pid == t.campeon else "lose"
+        else:
+            res = "lose"
+        saldo = await db(banco.saldo, j["cuenta"]) if j and j["cuenta"] else None
+        await send(ws, {"type": "torneo_fin", "campeon": campeon["nombre"], "campeon_pid": t.campeon,
+                        "pot": pozo, "result": res, "coins": saldo})
+
+
+async def torneo_salida(codigo, pid, ws):
+    """Un jugador cerró su conexión con el torneo."""
+    tor = torneos.get(codigo)
+    if tor is None or pid is None:
+        return
+    t = tor["t"]
+    if tor["ws"].get(pid) is ws:
+        del tor["ws"][pid]
+    if t.estado == "lobby":
+        j = t.jugador(pid)
+        if t.apuesta > 0 and j and j["cuenta"]:
+            await db(banco.devolver_cuenta, tor_sala(t), j["cuenta"])
+        t.quitar_humano(pid)
+        if not tor["ws"]:
+            torneos.pop(codigo, None)
+            return
+        if tor["host"] == pid:
+            tor["host"] = next(iter(tor["ws"]))
+        await tor_difundir(tor, tor_payload_lobby(tor))
+    elif t.estado == "en_juego":
+        if not tor["ws"]:   # no queda ningún humano: se cancela y se devuelven las apuestas
+            if t.apuesta > 0:
+                await db(banco.liquidar, tor_sala(t), None)
+            for partido_id in list(tor["salas"]):
+                tor_limpiar_sala(tor, partido_id)
+            for tarea in list(tor["tareas"]):
+                tarea.cancel()
+            torneos.pop(codigo, None)
+            return
+        afectados = [p["id"] for ronda in t.rondas for p in ronda
+                     if p["estado"] == "jugando" and pid in (p["a"], p["b"])]
+        for partido_id in afectados:   # abandonó en plena partida: gana el rival
+            p = t.partido(partido_id)
+            if p is None or p["estado"] != "jugando":
+                continue
+            otro = p["b"] if p["a"] == pid else p["a"]
+            oj = t.jugador(otro)
+            ganador = otro if not (oj and oj["humano"] and otro not in tor["ws"]) else random.choice([p["a"], p["b"]])
+            await torneo_cerrar(tor, partido_id, ganador)
+    else:
+        if not tor["ws"]:
+            torneos.pop(codigo, None)
+
+
+async def torneo_error(ws, mensaje):
+    await send(ws, {"type": "torneo_error", "message": mensaje})
+
+
+async def torneo_endpoint(ws: WebSocket):
+    await ws.accept()
+    codigo = None
+    pid = None
+    try:
+        raw = await ws.receive_text()
+        try:
+            req = json.loads(raw)
+        except Exception:
+            await torneo_error(ws, "Formato de mensaje inválido.")
+            return
+        action = req.get("action")
+        nombre = str(req.get("name", "Jugador"))[:32].strip() or "Jugador"
+        if action == "crear":
+            try:
+                tam = int(req.get("size"))
+            except (TypeError, ValueError):
+                tam = 0
+            if not TAM_MIN <= tam <= TAM_MAX:
+                await torneo_error(ws, "El torneo es de %d a %d jugadores." % (TAM_MIN, TAM_MAX))
+                return
+            if len(torneos) >= MAX_TORNEOS:
+                await torneo_error(ws, "Hay demasiados torneos abiertos. Probá en unos minutos.")
+                return
+            validada = await validar_apuesta(ws, req)
+            if validada is None:
+                return
+            bet, cuenta = validada
+            codigo = code_room()
+            t = Torneo(codigo, tam, bet, bool(req.get("powers")))
+            tor = {"t": t, "ws": {}, "host": None, "lock": asyncio.Lock(), "tareas": set(), "reportes": {},
+                   "inicio": {}, "esperas": set(), "repetidos": {}, "salas": {},
+                   "duenio": cuenta or await autenticar(req)}
+            torneos[codigo] = tor
+            if bet > 0 and not await db(banco.retener, cuenta, tor_sala(t), bet):
+                torneos.pop(codigo, None)
+                codigo = None
+                await torneo_error(ws, "Saldo insuficiente para esa apuesta.")
+                return
+            pid = t.agregar_humano(nombre_unico(t, nombre), cuenta)
+            tor["host"] = pid
+            tor["ws"][pid] = ws
+            await send(ws, {"type": "torneo_creado", "room": codigo, "pid": pid, "name": t.jugador(pid)["nombre"],
+                            "size": t.tam, "bet": t.apuesta, "powers": t.poderes})
+            await enviar_saldo(ws, cuenta)
+            await tor_difundir(tor, tor_payload_lobby(tor))
+        elif action == "unirse":
+            pedido = str(req.get("room", "")).strip().upper()
+            tor = torneos.get(pedido)
+            if tor is None or tor["t"].estado != "lobby" or not tor["t"].jugadores:
+                await torneo_error(ws, "Código inexistente o el torneo ya empezó.")
+                return
+            t = tor["t"]
+            async with tor["lock"]:
+                if t.estado != "lobby" or t.lugares_libres() <= 0:
+                    await torneo_error(ws, "El torneo ya está completo o empezó.")
+                    return
+                cuenta = None
+                if t.apuesta > 0:
+                    cuenta = await autenticar(req)
+                    if cuenta is None:
+                        await torneo_error(ws, "Para entrar a un torneo con apuesta necesitás una cuenta válida.")
+                        return
+                    if any(j["cuenta"] == cuenta for j in t.jugadores):
+                        await torneo_error(ws, "Ya estás anotado en este torneo.")
+                        return
+                    if not await db(banco.retener, cuenta, tor_sala(t), t.apuesta):
+                        await torneo_error(ws, "Saldo insuficiente: la inscripción es de %d monedas." % t.apuesta)
+                        return
+                pid = t.agregar_humano(nombre_unico(t, nombre), cuenta)
+            codigo = pedido
+            tor["ws"][pid] = ws
+            await send(ws, {"type": "torneo_unido", "room": codigo, "pid": pid, "name": t.jugador(pid)["nombre"],
+                            "size": t.tam, "bet": t.apuesta, "powers": t.poderes})
+            await enviar_saldo(ws, cuenta)
+            await tor_difundir(tor, tor_payload_lobby(tor))
+        else:
+            await torneo_error(ws, "Acción desconocida. Usá crear o unirse.")
+            return
+
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            accion = msg.get("action")
+            if accion == "salir":
+                break
+            if accion == "ping":
+                await send(ws, {"type": "pong"})
+                continue
+            tor = torneos.get(codigo)
+            if tor is None:
+                continue
+            if accion == "empezar":
+                if pid != tor["host"]:
+                    await torneo_error(ws, "Solo quien creó el torneo puede empezarlo.")
+                    continue
+                await torneo_empezar(tor)
+            elif accion == "resultado":
+                tor_tarea(tor, torneo_resultado(tor, pid, str(msg.get("match", "")), str(msg.get("winner", ""))))
+            elif accion == "estado":   # el cliente volvió a la pantalla: se le reenvía lo que se perdió
+                if tor["t"].estado == "lobby":
+                    await send(ws, tor_payload_lobby(tor))
+                else:
+                    await send(ws, tor_payload_cuadro(tor, "torneo_inicio"))
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        try:
+            await torneo_error(ws, str(exc)[:160])
+        except Exception:
+            pass
+    finally:
+        if codigo:
+            await torneo_salida(codigo, pid, ws)
+
+
 # ------------------------------------------------------------------- HTTP
 async def health(request):
-    return JSONResponse({"status": "ok", "service": "Truco Cordobes Online", "rooms": len(rooms),
+    return JSONResponse({"status": "ok", "service": "Truco Cordobes Online", "rooms": len(rooms), "torneos": len(torneos),
                          "db": banco.tipo, "persistente": banco.pg,
                          "database_url_cargada": banco.url_cargada,
                          "poderes_comprar": True, "gira_descuento": hasattr(banco, "gira_descuento"),
@@ -404,6 +796,11 @@ async def chat_invitar(request):
     if error:
         return error
     sala = str(datos.get("sala", "")).strip().upper()
+    tor = torneos.get(sala)
+    if tor is not None:   # torneo privado en su lobby: solo quien lo creó puede invitar
+        if tor.get("duenio") != cid or not _sala_espera(sala):
+            return JSONResponse({"error": "Ese torneo ya no está disponible."}, status_code=400)
+        return _respuesta_social(await db(social.invitar, cid, datos.get("otro"), sala, tor["t"].apuesta))
     room = rooms.get(sala)
     # La sala tiene que ser tuya (la creaste vos), seguir esperando y no estar llena.
     if room is None or room.get("duenio") != cid or not _sala_espera(sala):
@@ -426,7 +823,13 @@ async def chat_leer(request):
 
 
 async def info_sala(request):
-    room = rooms.get(request.path_params["code"].strip().upper())
+    codigo = request.path_params["code"].strip().upper()
+    tor = torneos.get(codigo)
+    if tor is not None:
+        t = tor["t"]
+        return JSONResponse({"exists": t.estado == "lobby" and bool(t.jugadores), "full": t.lugares_libres() <= 0,
+                             "bet": t.apuesta, "torneo": True, "size": t.tam, "powers": t.poderes})
+    room = rooms.get(codigo)
     if room is None:
         return JSONResponse({"exists": False, "full": False, "bet": 0})
     return JSONResponse({"exists": True, "full": sala_llena(room), "bet": room["bet"]})
@@ -745,9 +1148,9 @@ async def gira_logro(request):
         r = await db(banco.gira_truco_dia, cid, str(datos.get("evento", "")),
                      str(datos.get("nombre", "")), str(datos.get("club", "")))
         return JSONResponse(r, status_code=400 if "error" in r else 200)
-    if str(datos.get("logro", "")) in RULETA_LOGRO_PUNTOS:
-        # Ruleta: los puntos del casillero y el tope de giros por día los fija el servidor
-        r = await db(banco.gira_ruleta, cid, str(datos.get("evento", "")), str(datos.get("logro", "")),
+    if str(datos.get("logro", "")) in LOGROS_PERIODICOS:
+        # Ruleta, personaje del día y desafíos semanales: los puntos y el tope por día/semana los fija el servidor
+        r = await db(banco.gira_periodico, cid, str(datos.get("evento", "")), str(datos.get("logro", "")),
                      str(datos.get("nombre", "")), str(datos.get("club", "")))
         return JSONResponse(r, status_code=400 if "error" in r else 200)
     r = await db(banco.gira_logro, cid, str(datos.get("evento", "")), str(datos.get("logro", "")),
@@ -833,6 +1236,7 @@ app = Starlette(
         Route("/admin/credit", admin_recargar, methods=["POST"]),
         Route("/admin/account/{cid}", admin_cuenta),
         WebSocketRoute("/ws", websocket_endpoint),
+        WebSocketRoute("/ws_torneo", torneo_endpoint),
     ],
     lifespan=lifespan,
 )

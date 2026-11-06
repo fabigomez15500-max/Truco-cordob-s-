@@ -24,6 +24,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+import ranking
 from economia import Banco, DIA_LOGRO_ID, LOGROS_PERIODICOS, poderes_ofertas
 from social import Social
 from torneos import NOMBRES_BOT, TAM_MAX, TAM_MIN, Torneo, nombre_ronda
@@ -48,7 +49,9 @@ ESPERA_REPORTE = float(os.environ.get("ESPERA_REPORTE", "20"))  # segundos
 ESPERA_TICKET = int(os.environ.get("ESPERA_TICKET", "60"))  # mínimo entre resultados contra la IA
 MAX_TORNEOS = int(os.environ.get("MAX_TORNEOS", "200"))
 ESPERA_SALA_TORNEO = float(os.environ.get("ESPERA_SALA_TORNEO", "75"))   # s para que los dos entren a su partido
-MIN_PARTIDO_IA = float(os.environ.get("MIN_PARTIDO_IA", "15"))   # una partida contra un bot no puede terminar antes
+MIN_PARTIDO_IA = float(os.environ.get("MIN_PARTIDO_IA", "15"))
+RANK_MIN_SEG = float(os.environ.get("RANK_MIN_SEG", "45"))          # una partida más corta no suma al ranking
+RANK_ABANDONO_SEG = float(os.environ.get("RANK_ABANDONO_SEG", "90"))   # abandono que cuenta como derrota   # una partida contra un bot no puede terminar antes
 
 rooms = {}
 torneos = {}   # código -> torneo privado (en memoria; si el servidor se reinicia, las apuestas se devuelven)
@@ -72,7 +75,8 @@ def code_room():
 def nueva_sala(apuesta=0):
     return {"players": [], "lock": asyncio.Lock(), "seq": 0, "bet": int(apuesta),
             "reservas": 0, "started": False, "settled": True,
-            "reports": {}, "accounts": {}, "timer": None}
+            "reports": {}, "accounts": {}, "timer": None,
+            "rank_reports": {}, "rank_idx": 0, "rank_hecho": False, "rank_timer": None, "inicio": 0.0}
 
 
 async def send(ws, payload):
@@ -120,6 +124,9 @@ async def attach(room_code, name, ws, account=None):
         room["started"] = True
         room["settled"] = room["bet"] <= 0
         room["reports"] = {}
+        room["inicio"] = time.time()
+        room["rank_hecho"] = False
+        room["rank_reports"] = {}
         await broadcast(room, {
             "type": "match_found", "room": room_code, "bet": room["bet"],
             "players": [p["name"] for p in sorted(room["players"], key=lambda p: p["slot"])],
@@ -215,8 +222,63 @@ async def esperar_reporte(room_code, room):
         await liquidar_sala(room_code, room, None)
 
 
-async def recibir_resultado(room_code, room, slot, ganador):
-    if room["bet"] <= 0 or room["settled"] or ganador not in (0, 1) or slot not in (0, 1):
+# ------------------------------------------------------- ranking semanal (partidas 1 a 1)
+def _marcador_valido(score):
+    try:
+        a, b = int(score[0]), int(score[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    return (a, b) if 0 <= a <= 30 and 0 <= b <= 30 else None
+
+
+async def rank_otorgar(room_code, room, ganador_slot, margen=0):
+    """Suma los puntos de la partida (una sola vez por partida) y avisa a cada jugador cuánto ganó."""
+    if room["rank_hecho"]:
+        return
+    room["rank_hecho"] = True
+    a0, a1 = room["accounts"].get(0), room["accounts"].get(1)
+    if not a0 or not a1 or a0 == a1 or ganador_slot not in (0, 1):
+        return
+    if time.time() - room["inicio"] < RANK_MIN_SEG:
+        return
+    ganador = a0 if ganador_slot == 0 else a1
+    evento = "P:%s:%d" % (room_code, room["rank_idx"])
+    pagos = await db(banco.semanal_partida, evento, a0, a1, ganador, margen, room["bet"])
+    for p in list(room["players"]):
+        r = pagos.get(p.get("account"))
+        if r:
+            await send(p["ws"], {"type": "rank_points", "points": r["puntos"],
+                                 "missions": [{"titulo": m["titulo"], "premio": m["premio"]} for m in r["misiones"]]})
+
+
+async def rank_esperar(room_code, room):
+    """Si solo uno informó el resultado y el otro no aparece, vale lo que dijo el que informó."""
+    await asyncio.sleep(ESPERA_REPORTE)
+    if room["rank_hecho"] or rooms.get(room_code) is not room or len(room["rank_reports"]) != 1:
+        return
+    ganador, score = next(iter(room["rank_reports"].values()))
+    await rank_otorgar(room_code, room, ganador, 0)
+
+
+async def rank_reportar(room_code, room, slot, ganador, score):
+    if room["rank_hecho"] or not room["started"]:
+        return
+    room["rank_reports"][slot] = (ganador, _marcador_valido(score))
+    if len(room["rank_reports"]) == 2:
+        (g0, s0), (g1, s1) = room["rank_reports"][0], room["rank_reports"][1]
+        if g0 == g1:
+            await rank_otorgar(room_code, room, g0, abs(s0[0] - s0[1]) if s0 and s0 == s1 else 0)
+        else:
+            room["rank_hecho"] = True      # los celulares no coinciden: no suma nadie
+    elif room.get("rank_timer") is None:
+        room["rank_timer"] = asyncio.create_task(rank_esperar(room_code, room))
+
+
+async def recibir_resultado(room_code, room, slot, ganador, score=None):
+    if ganador not in (0, 1) or slot not in (0, 1):
+        return
+    await rank_reportar(room_code, room, slot, ganador, score)
+    if room["bet"] <= 0 or room["settled"]:
         return
     room["reports"][slot] = ganador
     if len(room["reports"]) == 2:
@@ -244,6 +306,15 @@ async def reiniciar_apuesta(room_code, room):
 
 async def cerrar_jugador(room_code, room, slot, ws):
     """Un jugador se fue: devolver apuesta si no había partida, o perder por abandono."""
+    if room["started"] and not room["rank_hecho"]:
+        restante = next((p for p in room["players"] if p["ws"] is not ws), None)
+        if restante is not None:
+            if room["rank_reports"]:
+                g = next(iter(room["rank_reports"].values()))[0]
+                if g == restante["slot"]:
+                    await rank_otorgar(room_code, room, g, 0)
+            elif time.time() - room["inicio"] >= RANK_ABANDONO_SEG:   # abandonó jugando: gana quien se queda
+                await rank_otorgar(room_code, room, restante["slot"], 0)
     room["players"][:] = [p for p in room["players"] if p["ws"] is not ws]
     if room["players"]:
         await broadcast(room, {"type": "opponent_left", "message": "El rival se desconecto."})
@@ -472,6 +543,19 @@ async def torneo_terminar(tor):
         else:
             pagos = await db(banco.perder_retenciones, tor_sala(t))
     pozo = sum(pagos.values())
+    puntos_rank = {}   # ranking semanal: solo si jugaron suficientes humanos con cuenta
+    misiones_rank = {}
+    humanos = [j for j in t.jugadores if j["humano"] and j["cuenta"]]
+    if len(humanos) >= ranking.TORNEO_MIN_HUMANOS:
+        podio = t.podio()
+        for j in humanos:
+            if j["pid"] in podio:
+                puntos_rank[j["pid"]] = await db(banco.semanal_sumar, j["cuenta"], ranking.PTS_TORNEO[podio[j["pid"]]],
+                                                 "T:%s:%s" % (t.codigo, j["cuenta"]))
+            m = await db(banco.semanal_mision, j["cuenta"], "torneo1", 1)   # terminar un torneo: misión semanal
+            if m:
+                misiones_rank[j["pid"]] = [{"titulo": m["titulo"], "premio": m["premio"]}]
+                puntos_rank[j["pid"]] = puntos_rank.get(j["pid"], 0) + m["premio"]
     for pid, ws in list(tor["ws"].items()):
         j = t.jugador(pid)
         if not pagos:
@@ -482,7 +566,8 @@ async def torneo_terminar(tor):
             res = "lose"
         saldo = await db(banco.saldo, j["cuenta"]) if j and j["cuenta"] else None
         await send(ws, {"type": "torneo_fin", "campeon": campeon["nombre"], "campeon_pid": t.campeon,
-                        "pot": pozo, "result": res, "coins": saldo})
+                        "pot": pozo, "result": res, "coins": saldo, "rank": puntos_rank.get(pid, 0),
+                        "missions": misiones_rank.get(pid, [])})
 
 
 async def torneo_salida(codigo, pid, ws):
@@ -561,6 +646,7 @@ async def torneo_endpoint(ws: WebSocket):
             if validada is None:
                 return
             bet, cuenta = validada
+            cuenta = cuenta or await autenticar(req)   # sin apuesta también: el ranking semanal usa la cuenta
             codigo = code_room()
             t = Torneo(codigo, tam, bet, bool(req.get("powers")))
             tor = {"t": t, "ws": {}, "host": None, "lock": asyncio.Lock(), "tareas": set(), "reportes": {},
@@ -590,15 +676,14 @@ async def torneo_endpoint(ws: WebSocket):
                 if t.estado != "lobby" or t.lugares_libres() <= 0:
                     await torneo_error(ws, "El torneo ya está completo o empezó.")
                     return
-                cuenta = None
+                cuenta = await autenticar(req)   # sin apuesta también: el ranking semanal usa la cuenta
+                if t.apuesta > 0 and cuenta is None:
+                    await torneo_error(ws, "Para entrar a un torneo con apuesta necesitás una cuenta válida.")
+                    return
+                if cuenta and any(j["cuenta"] == cuenta for j in t.jugadores):
+                    await torneo_error(ws, "Ya estás anotado en este torneo.")
+                    return
                 if t.apuesta > 0:
-                    cuenta = await autenticar(req)
-                    if cuenta is None:
-                        await torneo_error(ws, "Para entrar a un torneo con apuesta necesitás una cuenta válida.")
-                        return
-                    if any(j["cuenta"] == cuenta for j in t.jugadores):
-                        await torneo_error(ws, "Ya estás anotado en este torneo.")
-                        return
                     if not await db(banco.retener, cuenta, tor_sala(t), t.apuesta):
                         await torneo_error(ws, "Saldo insuficiente: la inscripción es de %d monedas." % t.apuesta)
                         return
@@ -943,7 +1028,8 @@ async def websocket_endpoint(ws: WebSocket):
             bet, cuenta = validada
             room_code = code_room()
             rooms[room_code] = nueva_sala(bet)
-            rooms[room_code]["duenio"] = cuenta or await autenticar(req)   # dueño de la sala (solo para invitaciones)
+            cuenta = cuenta or await autenticar(req)   # sin apuesta también: el ranking semanal necesita la cuenta
+            rooms[room_code]["duenio"] = cuenta   # dueño de la sala (solo para invitaciones)
             if bet > 0 and not await db(banco.retener, cuenta, room_code, bet):
                 rooms.pop(room_code, None)
                 room_code = None
@@ -985,6 +1071,8 @@ async def websocket_endpoint(ws: WebSocket):
                     room_code = None
                     await send(ws, {"type": "error", "message": "La sala ya no existe. Se te devolvió la apuesta."})
                     return
+            if cuenta is None:
+                cuenta = await autenticar(req)   # sin apuesta también: el ranking semanal necesita la cuenta
             slot = await attach(room_code, player_name, ws, cuenta)
             if slot is None:
                 if cuenta:
@@ -999,6 +1087,8 @@ async def websocket_endpoint(ws: WebSocket):
             if validada is None:
                 return
             bet, cuenta = validada
+            if cuenta is None:
+                cuenta = await autenticar(req)   # sin apuesta también: el ranking semanal necesita la cuenta
             if bet > 0 and await db(banco.saldo, cuenta) < bet:
                 await send(ws, {"type": "error", "message": "Saldo insuficiente para esa apuesta."})
                 return
@@ -1085,11 +1175,17 @@ async def websocket_endpoint(ws: WebSocket):
             if room is None:
                 continue
             if accion == "result":
-                await recibir_resultado(room_code, room, slot, msg.get("winner_slot"))
+                await recibir_resultado(room_code, room, slot, msg.get("winner_slot"), msg.get("score"))
                 continue
             if accion == "game_event":
                 payload = msg.get("payload", {})
                 evento = payload.get("event") if isinstance(payload, dict) else None
+                if evento == "rematch_start" and slot == 0:   # revancha: otra partida para el ranking
+                    room["rank_reports"] = {}
+                    room["rank_hecho"] = False
+                    room["rank_timer"] = None
+                    room["rank_idx"] += 1
+                    room["inicio"] = time.time()
                 if evento == "rematch_start" and room["bet"] > 0:
                     if slot != 0 or not room["settled"]:
                         continue
@@ -1197,6 +1293,25 @@ async def gira_podio(request):
     return JSONResponse(await db(banco.gira_podio, max(1, min(limite, 10))))
 
 
+async def semanal_ranking(request):
+    """Ranking semanal: top 10, mi puesto (si mandás id y token) y el podio de la semana pasada."""
+    datos = await leer_json(request)
+    cid = str(datos.get("id", "")).strip().upper()
+    if not cid or not await db(banco.autenticar, cid, str(datos.get("token", ""))):
+        cid = None
+    return JSONResponse(await db(banco.semanal_ranking, cid, 10))
+
+
+async def semanal_ia(request):
+    """+1 punto semanal por ganarle a la IA (con tope diario)."""
+    datos = await leer_json(request)
+    cid = str(datos.get("id", "")).strip().upper()
+    if not await db(banco.autenticar, cid, str(datos.get("token", ""))):
+        return JSONResponse({"error": "Cuenta inválida."}, status_code=401)
+    r = await db(banco.semanal_ia, cid, "IA:%s:%s" % (cid, str(datos.get("evento", ""))[:40]), ESPERA_TICKET)
+    return JSONResponse(r, status_code=400 if "error" in r else 200)
+
+
 async def lifespan(app):
     if not banco.pg:
         print("[truco] ATENCIÓN: sin DATABASE_URL se usa SQLite local: los saldos y cuentas "
@@ -1233,6 +1348,8 @@ app = Starlette(
         Route("/gira/sincronizar", gira_sincronizar, methods=["POST"]),
         Route("/gira/mi_estado", gira_mi_estado, methods=["POST"]),
         Route("/gira/podio", gira_podio),
+        Route("/semanal/ranking", semanal_ranking, methods=["POST"]),
+        Route("/semanal/ia", semanal_ia, methods=["POST"]),
         Route("/admin/credit", admin_recargar, methods=["POST"]),
         Route("/admin/account/{cid}", admin_cuenta),
         WebSocketRoute("/ws", websocket_endpoint),

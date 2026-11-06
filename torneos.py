@@ -154,6 +154,23 @@ class Torneo:
         j = self.jugador(pid) if pid else None
         return j["nombre"] if j else ""
 
+    def podio(self):
+        """{pid: 'campeon' | 'finalista' | 'semifinalista'} de un torneo terminado."""
+        res = {}
+        if self.campeon:
+            res[self.campeon] = "campeon"
+        if self.rondas:
+            final = self.rondas[-1][0]
+            for x in (final["a"], final["b"]):
+                if x and x != self.campeon:
+                    res[x] = "finalista"
+        if len(self.rondas) >= 2:
+            for p in self.rondas[-2]:
+                if p["a"] and p["b"] and p["w"]:
+                    perdedor = p["b"] if p["w"] == p["a"] else p["a"]
+                    res.setdefault(perdedor, "semifinalista")
+        return res
+
     def cuadro_publico(self):
         """Lo que ven los jugadores: rondas con nombres, y quién ganó."""
         total = len(self.rondas)

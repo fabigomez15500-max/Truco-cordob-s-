@@ -406,6 +406,49 @@ class Banco:
             return pagos
         return self._transaccion(trabajo)
 
+    def liquidar_cuatro(self, sala, ganadores, multiplicador=0):
+        """Cierra las retenciones abiertas de una sala de truco de a 4, una sola vez.
+
+        multiplicador 0: el pozo entero se reparte en partes iguales entre `ganadores` (cuentas que apostaron).
+        multiplicador n > 0: cada ganador cobra n veces lo que apostó (contra la IA paga la casa).
+        Sin ganadores válidos: cada uno recupera lo suyo.
+        Devuelve {cuenta: monto_cobrado} (vacío si no había nada abierto).
+        """
+        pedidos = sorted({str(g).upper() for g in (ganadores or []) if g})
+        mult = int(multiplicador or 0)
+
+        def trabajo(q):
+            filas = q("SELECT id, cuenta, monto FROM retenciones WHERE sala = ? AND abierta = 1", (sala,)).fetchall()
+            if not filas:
+                return {}
+            now = int(time.time())
+            apostado = {}
+            for f in filas:
+                apostado[f[1]] = apostado.get(f[1], 0) + int(f[2])
+            validos = [c for c in pedidos if c in apostado]
+            pagos = {}
+            if not validos:
+                pagos = dict(apostado)
+                motivo = "devolucion"
+            elif mult > 0:
+                for c in validos:
+                    pagos[c] = mult * apostado[c]
+                motivo = "premio_ia"
+            else:
+                pozo = sum(apostado.values())
+                parte = pozo // len(validos)
+                for i, c in enumerate(validos):
+                    pagos[c] = parte + (pozo - parte * len(validos) if i == 0 else 0)
+                motivo = "premio"
+            for cid, monto in pagos.items():
+                q("UPDATE cuentas SET monedas = monedas + ? WHERE id = ?", (monto, cid))
+                q("INSERT INTO movimientos (cuenta, delta, motivo, ref, fecha) VALUES (?, ?, ?, ?, ?)",
+                  (cid, monto, motivo, sala, now))
+            for f in filas:
+                q("UPDATE retenciones SET abierta = 0 WHERE id = ?", (f[0],))
+            return pagos
+        return self._transaccion(trabajo)
+
     def devolver_cuenta(self, sala, cuenta_id):
         """Devuelve lo que una cuenta tenía retenido en la sala (p. ej. al irse de un torneo antes de empezar).
 
